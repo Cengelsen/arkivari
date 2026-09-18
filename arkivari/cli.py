@@ -6,8 +6,10 @@ import argparse
 import json
 import logging
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
@@ -41,6 +43,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Discover URLs only; do not archive",
     )
     parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Archive without confirmation prompt",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("arkivari-results.json"),
@@ -62,6 +70,46 @@ def build_parser() -> argparse.ArgumentParser:
         version=f"%(prog)s {__version__}",
     )
     return parser
+
+
+def _url_section(url: str) -> str:
+    path = urlparse(url).path or "/"
+    if path == "/":
+        return "/ (homepage)"
+    segment = path.strip("/").split("/")[0]
+    return f"/{segment}/"
+
+
+def print_discovery_overview(
+    domain: str,
+    discovered_urls: list[str],
+    max_archives: int,
+) -> None:
+    """Print a summary of discovered URLs before archiving."""
+    count = len(discovered_urls)
+    to_archive = min(count, max_archives)
+
+    print(f"\nDiscovery complete for {domain}")
+    print(f"  Pages found:     {count}")
+    print(f"  To archive:      {to_archive}")
+
+    sections = Counter(_url_section(url) for url in discovered_urls)
+    if len(sections) > 1:
+        print("  By section:")
+        for section, section_count in sorted(sections.items(), key=lambda item: (-item[1], item[0])):
+            print(f"    {section_count:>4}  {section}")
+    print()
+
+
+def confirm_archive() -> bool:
+    """Ask the user whether to proceed with archiving."""
+    while True:
+        answer = input("Archive these pages to Internet Archive? [y/N] ").strip().lower()
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no", ""):
+            return False
+        print("Please answer yes or no.")
 
 
 def write_report(
@@ -117,13 +165,6 @@ def main(argv: list[str] | None = None) -> int:
         log.error("No URLs discovered for %s", base_url)
         return 2
 
-    if len(discovered_urls) > args.max_archives and not args.dry_run:
-        log.warning(
-            "Discovered %d URLs but will archive at most %d this run",
-            len(discovered_urls),
-            args.max_archives,
-        )
-
     summary: dict = {
         "archived_count": 0,
         "cached_count": 0,
@@ -134,10 +175,21 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     if args.dry_run:
+        print_discovery_overview(base_url, discovered_urls, args.max_archives)
         log.info("Dry run: discovered %d URLs", len(discovered_urls))
         for url in discovered_urls:
             summary["results"].append({"url": url, "status": "discovered"})
     else:
+        print_discovery_overview(base_url, discovered_urls, args.max_archives)
+        if not args.yes and not confirm_archive():
+            log.info("Archiving cancelled by user")
+            for url in discovered_urls:
+                summary["results"].append({"url": url, "status": "discovered"})
+            summary["cancelled"] = True
+            write_report(args.output, base_url, discovered_urls, summary)
+            log.info("Wrote report to %s", args.output)
+            return 0
+
         archive_summary = archive_urls(
             discovered_urls,
             robots,

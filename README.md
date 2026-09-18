@@ -18,10 +18,13 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-# Discover and archive all public pages on a domain
+# Discover pages, show overview, then confirm before archiving
 python -m arkivari example.com
 
-# Discover only (no archiving)
+# Skip confirmation prompt
+python -m arkivari example.com --yes
+
+# Discover only (no archiving, no prompt)
 python -m arkivari example.com --dry-run --verbose
 
 # Limit discovery and archiving
@@ -38,6 +41,7 @@ python -m arkivari example.com --output results.json
 | `--max-pages` | 500 | Max pages to discover via crawling |
 | `--max-archives` | 4000 | Max URLs to submit to Internet Archive |
 | `--dry-run` | off | Discover only, don't archive |
+| `--yes`, `-y` | off | Archive without confirmation prompt |
 | `--output` | `arkivari-results.json` | JSON report path |
 | `--user-agent` | `arkivari/1.0 (...)` | User-Agent for crawl and archive requests |
 | `--verbose` | off | Per-URL logging |
