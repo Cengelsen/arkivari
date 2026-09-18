@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
+from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
@@ -15,6 +16,13 @@ logger = logging.getLogger(__name__)
 
 SKIP_SCHEMES = {"", "mailto", "javascript", "tel", "ftp", "data"}
 HTML_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
+INDEX_PATHS = {"/index.html", "/index.htm", "/index.php"}
+
+
+@dataclass
+class DiscoveryResult:
+    urls: list[str]
+    duplicates_skipped: int
 
 
 def normalize_domain(domain: str) -> str:
@@ -39,16 +47,46 @@ def normalize_domain(domain: str) -> str:
 
 def normalize_url(url: str) -> str | None:
     """Normalize a URL for deduplication; return None for non-http(s) links."""
-    parsed = urlparse(url)
+    parsed = urlparse(url.strip())
     if parsed.scheme not in ("http", "https"):
         return None
 
     netloc = parsed.netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    if netloc.endswith(":80"):
+        netloc = netloc[:-3]
+    elif netloc.endswith(":443"):
+        netloc = netloc[:-4]
+
     path = parsed.path or "/"
-    if path != "/" and path.endswith("/"):
+    if path.lower() in INDEX_PATHS:
+        path = "/"
+    elif path != "/" and path.endswith("/"):
         path = path.rstrip("/")
 
-    return urlunparse((parsed.scheme, netloc, path, "", parsed.query, ""))
+    return urlunparse(("https", netloc, path, "", parsed.query, ""))
+
+
+def deduplicate_urls(urls: list[str], verbose: bool = False) -> tuple[list[str], int]:
+    """Remove duplicate URLs after normalization, keeping the first occurrence."""
+    seen: set[str] = set()
+    unique: list[str] = []
+    duplicates_skipped = 0
+
+    for url in urls:
+        normalized = normalize_url(url)
+        if not normalized:
+            continue
+        if normalized in seen:
+            duplicates_skipped += 1
+            if verbose:
+                logger.info("Skipping duplicate URL: %s", url)
+            continue
+        seen.add(normalized)
+        unique.append(normalized)
+
+    return sorted(unique), duplicates_skipped
 
 
 def same_domain(url: str, target_netloc: str) -> bool:
@@ -202,7 +240,7 @@ def discover_urls(
     user_agent: str,
     max_pages: int,
     verbose: bool = False,
-) -> list[str]:
+) -> DiscoveryResult:
     """Discover public URLs on a domain via sitemaps and crawling."""
     base_url = normalize_domain(domain)
     target_netloc = urlparse(base_url).netloc.lower()
@@ -221,6 +259,11 @@ def discover_urls(
         verbose=verbose,
     )
 
-    all_urls = sorted(sitemap_urls | crawled_urls)
-    logger.info("Discovered %d unique URLs", len(all_urls))
-    return all_urls
+    combined = list(sitemap_urls) + list(crawled_urls)
+    all_urls, duplicates_skipped = deduplicate_urls(combined, verbose=verbose)
+    logger.info(
+        "Discovered %d unique URLs (%d duplicates skipped)",
+        len(all_urls),
+        duplicates_skipped,
+    )
+    return DiscoveryResult(urls=all_urls, duplicates_skipped=duplicates_skipped)

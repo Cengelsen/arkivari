@@ -21,9 +21,18 @@ WAYBACK_BASE = "https://web.archive.org"
 ANONYMOUS_CAPTURES_PER_MINUTE = 3
 ANONYMOUS_DAILY_CAP = 4000
 MIN_INTERVAL_SECONDS = 60.0 / ANONYMOUS_CAPTURES_PER_MINUTE
+ESTIMATED_CAPTURE_SECONDS = 15.0
 MAX_RETRIES = 5
 POLL_INTERVAL_SECONDS = 3.0
 MAX_POLL_SECONDS = 120.0
+
+
+def estimate_archive_seconds(page_count: int) -> float:
+    """Estimate wall-clock time to archive pages at anonymous IA rate limits."""
+    if page_count <= 0:
+        return 0.0
+    per_page = MIN_INTERVAL_SECONDS + ESTIMATED_CAPTURE_SECONDS
+    return ESTIMATED_CAPTURE_SECONDS + (page_count - 1) * per_page
 
 JOB_ID_PATTERN = re.compile(r'watchJob\("([^"]+)"')
 SPN_MESSAGE_PATTERN = re.compile(r'id="spn-message">([^<]+)')

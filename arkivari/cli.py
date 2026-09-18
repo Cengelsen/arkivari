@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 import requests
 
 from arkivari import DEFAULT_USER_AGENT, __version__
-from arkivari.archive import ANONYMOUS_DAILY_CAP, archive_urls
+from arkivari.archive import ANONYMOUS_DAILY_CAP, archive_urls, estimate_archive_seconds
 from arkivari.discover import discover_urls, normalize_domain
 from arkivari.robots import RobotsPolicy
 
@@ -72,6 +72,17 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _format_duration(seconds: float) -> str:
+    total = int(round(seconds))
+    if total < 60:
+        return f"~{total}s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"~{minutes}m {secs}s" if secs else f"~{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    return f"~{hours}h {minutes}m" if minutes else f"~{hours}h"
+
+
 def _url_section(url: str) -> str:
     path = urlparse(url).path or "/"
     if path == "/":
@@ -84,14 +95,20 @@ def print_discovery_overview(
     domain: str,
     discovered_urls: list[str],
     max_archives: int,
+    duplicates_skipped: int = 0,
 ) -> None:
     """Print a summary of discovered URLs before archiving."""
     count = len(discovered_urls)
     to_archive = min(count, max_archives)
 
+    estimated = _format_duration(estimate_archive_seconds(to_archive))
+
     print(f"\nDiscovery complete for {domain}")
     print(f"  Pages found:     {count}")
+    if duplicates_skipped:
+        print(f"  Duplicates:      {duplicates_skipped} skipped")
     print(f"  To archive:      {to_archive}")
+    print(f"  Est. duration:   {estimated}")
 
     sections = Counter(_url_section(url) for url in discovered_urls)
     if len(sections) > 1:
@@ -149,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
     robots.load()
 
     try:
-        discovered_urls = discover_urls(
+        discovery = discover_urls(
             args.domain,
             robots,
             session,
@@ -157,6 +174,7 @@ def main(argv: list[str] | None = None) -> int:
             max_pages=args.max_pages,
             verbose=args.verbose,
         )
+        discovered_urls = discovery.urls
     except requests.RequestException as exc:
         log.error("Discovery failed: %s", exc)
         return 2
@@ -175,12 +193,16 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     if args.dry_run:
-        print_discovery_overview(base_url, discovered_urls, args.max_archives)
+        print_discovery_overview(
+            base_url, discovered_urls, args.max_archives, discovery.duplicates_skipped
+        )
         log.info("Dry run: discovered %d URLs", len(discovered_urls))
         for url in discovered_urls:
             summary["results"].append({"url": url, "status": "discovered"})
     else:
-        print_discovery_overview(base_url, discovered_urls, args.max_archives)
+        print_discovery_overview(
+            base_url, discovered_urls, args.max_archives, discovery.duplicates_skipped
+        )
         if not args.yes and not confirm_archive():
             log.info("Archiving cancelled by user")
             for url in discovered_urls:
