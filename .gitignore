@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 arkivari-results.json
+arkivari-queue-*.json

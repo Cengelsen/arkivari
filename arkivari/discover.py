@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
@@ -17,12 +17,31 @@ logger = logging.getLogger(__name__)
 SKIP_SCHEMES = {"", "mailto", "javascript", "tel", "ftp", "data"}
 HTML_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
 INDEX_PATHS = {"/index.html", "/index.htm", "/index.php"}
+SITEMAP_TIMEOUT_SECONDS = 60
+
+
+@dataclass
+class DiscoveryStats:
+    discovery_limit: int
+    sitemap_urls_found: int = 0
+    sitemap_urls_selected: int = 0
+    crawled_urls_found: int = 0
+    overlap: int = 0
+    duplicates_skipped: int = 0
+    discovery_capped: bool = False
+    crawl_capped: bool = False
+    crawl_skipped: bool = False
+    sitemap_failures: list[str] = field(default_factory=list)
 
 
 @dataclass
 class DiscoveryResult:
     urls: list[str]
-    duplicates_skipped: int
+    stats: DiscoveryStats
+
+    @property
+    def duplicates_skipped(self) -> int:
+        return self.stats.duplicates_skipped
 
 
 def normalize_domain(domain: str) -> str:
@@ -108,25 +127,38 @@ def parse_sitemap(
     session: requests.Session,
     user_agent: str,
     robots: RobotsPolicy,
+    failures: list[str],
     depth: int = 0,
-    max_depth: int = 3,
+    max_depth: int = 5,
 ) -> set[str]:
     """Parse a sitemap or sitemap index and return same-domain page URLs."""
     if depth > max_depth:
+        logger.info("Sitemap index depth limit reached at %s", sitemap_url)
         return set()
 
     if not robots.can_fetch(sitemap_url):
-        logger.debug("Skipping disallowed sitemap: %s", sitemap_url)
+        message = f"{sitemap_url}: disallowed by robots.txt"
+        failures.append(message)
+        logger.info("Skipping disallowed sitemap: %s", sitemap_url)
         return set()
 
     robots.wait_for_crawl()
     try:
-        response = session.get(sitemap_url, headers={"User-Agent": user_agent}, timeout=15)
+        response = session.get(
+            sitemap_url,
+            headers={"User-Agent": user_agent},
+            timeout=SITEMAP_TIMEOUT_SECONDS,
+        )
     except requests.RequestException as exc:
-        logger.warning("Failed to fetch sitemap %s: %s", sitemap_url, exc)
+        message = f"{sitemap_url}: {exc}"
+        failures.append(message)
+        logger.info("Failed to fetch sitemap %s: %s", sitemap_url, exc)
         return set()
 
     if response.status_code != 200:
+        message = f"{sitemap_url}: HTTP {response.status_code}"
+        failures.append(message)
+        logger.info("Sitemap unavailable: %s (HTTP %d)", sitemap_url, response.status_code)
         return set()
 
     soup = BeautifulSoup(response.content, "xml")
@@ -141,6 +173,7 @@ def parse_sitemap(
                 session,
                 user_agent,
                 robots,
+                failures,
                 depth=depth + 1,
                 max_depth=max_depth,
             )
@@ -154,6 +187,9 @@ def parse_sitemap(
         if candidate and same_domain(candidate, target_netloc):
             urls.add(candidate)
 
+    if urls:
+        logger.info("Sitemap %s: %d URLs", sitemap_url, len(urls))
+
     return urls
 
 
@@ -162,12 +198,24 @@ def discover_from_sitemaps(
     target_netloc: str,
     session: requests.Session,
     user_agent: str,
-) -> set[str]:
+) -> tuple[set[str], list[str]]:
     urls: set[str] = set()
+    failures: list[str] = []
     for sitemap_url in robots.default_sitemap_urls():
-        found = parse_sitemap(sitemap_url, target_netloc, session, user_agent, robots)
+        found = parse_sitemap(
+            sitemap_url,
+            target_netloc,
+            session,
+            user_agent,
+            robots,
+            failures,
+        )
         urls.update(found)
-    return urls
+    return urls, failures
+
+
+def _unlimited(max_pages: int) -> bool:
+    return max_pages <= 0
 
 
 def crawl_site(
@@ -177,17 +225,26 @@ def crawl_site(
     session: requests.Session,
     user_agent: str,
     max_pages: int,
+    exclude: set[str] | None = None,
     verbose: bool = False,
-) -> set[str]:
-    """Bounded BFS crawl of HTML pages on the target domain."""
+) -> tuple[set[str], bool]:
+    """Bounded BFS crawl of HTML pages on the target domain.
+
+    Returns discovered URLs (not in exclude) and whether the crawl hit its page budget
+    while URLs remained in the queue. max_pages <= 0 means no limit.
+    """
+    exclude = exclude or set()
     discovered: set[str] = set()
     queue: deque[str] = deque([seed_url])
+    seen: set[str] = set()
 
-    while queue and len(discovered) < max_pages:
+    while queue and (_unlimited(max_pages) or len(discovered) < max_pages):
         current = queue.popleft()
         normalized = normalize_url(current)
-        if not normalized or normalized in discovered:
+        if not normalized or normalized in seen:
             continue
+        seen.add(normalized)
+
         if not same_domain(normalized, target_netloc):
             continue
         if not robots.can_fetch(normalized):
@@ -208,9 +265,10 @@ def crawl_site(
         if not is_html_response(response):
             continue
 
-        discovered.add(normalized)
-        if verbose:
-            logger.info("Crawled: %s", normalized)
+        if normalized not in exclude:
+            discovered.add(normalized)
+            if verbose:
+                logger.info("Crawled: %s", normalized)
 
         soup = BeautifulSoup(response.text, "html.parser")
         for link in soup.find_all("a", href=True):
@@ -227,10 +285,11 @@ def crawl_site(
                 continue
             if not same_domain(full_url, target_netloc):
                 continue
-            if full_url not in discovered:
+            if full_url not in seen:
                 queue.append(full_url)
 
-    return discovered
+    crawl_capped = bool(queue) and not _unlimited(max_pages) and len(discovered) >= max_pages
+    return discovered, crawl_capped
 
 
 def discover_urls(
@@ -241,29 +300,65 @@ def discover_urls(
     max_pages: int,
     verbose: bool = False,
 ) -> DiscoveryResult:
-    """Discover public URLs on a domain via sitemaps and crawling."""
+    """Discover public URLs on a domain via sitemaps (first) and crawling."""
     base_url = normalize_domain(domain)
     target_netloc = urlparse(base_url).netloc.lower()
     if target_netloc.startswith("www."):
         target_netloc = target_netloc[4:]
 
     seed_url = base_url + "/"
-    sitemap_urls = discover_from_sitemaps(robots, target_netloc, session, user_agent)
-    crawled_urls = crawl_site(
-        seed_url,
-        target_netloc,
-        robots,
-        session,
-        user_agent,
-        max_pages=max_pages,
-        verbose=verbose,
+    stats = DiscoveryStats(discovery_limit=max_pages)
+
+    sitemap_urls, stats.sitemap_failures = discover_from_sitemaps(
+        robots, target_netloc, session, user_agent
+    )
+    stats.sitemap_urls_found = len(sitemap_urls)
+
+    if _unlimited(max_pages):
+        sitemap_selected = sorted(sitemap_urls)
+        stats.sitemap_urls_selected = len(sitemap_selected)
+        stats.discovery_capped = False
+        crawl_budget = -1
+    else:
+        sitemap_selected = sorted(sitemap_urls)[:max_pages]
+        stats.sitemap_urls_selected = len(sitemap_selected)
+        stats.discovery_capped = stats.sitemap_urls_found > max_pages
+        crawl_budget = max_pages - len(sitemap_selected)
+
+    if crawl_budget == 0:
+        stats.crawl_skipped = True
+        crawled_urls: set[str] = set()
+        stats.crawl_capped = False
+    else:
+        stats.crawl_skipped = False
+        crawled_urls, stats.crawl_capped = crawl_site(
+            seed_url,
+            target_netloc,
+            robots,
+            session,
+            user_agent,
+            max_pages=crawl_budget,
+            exclude=set(sitemap_selected),
+            verbose=verbose,
+        )
+
+    stats.crawled_urls_found = len(crawled_urls)
+    stats.overlap = len(set(sitemap_selected) & crawled_urls)
+
+    combined = list(sitemap_selected) + list(crawled_urls)
+    all_urls, stats.duplicates_skipped = deduplicate_urls(combined, verbose=verbose)
+
+    if not _unlimited(max_pages) and len(all_urls) > max_pages:
+        all_urls = all_urls[:max_pages]
+        stats.discovery_capped = True
+
+    logger.info(
+        "Discovered %d URLs (sitemap: %d, crawl: %d, overlap: %d, duplicates: %d)",
+        len(all_urls),
+        stats.sitemap_urls_selected,
+        stats.crawled_urls_found,
+        stats.overlap,
+        stats.duplicates_skipped,
     )
 
-    combined = list(sitemap_urls) + list(crawled_urls)
-    all_urls, duplicates_skipped = deduplicate_urls(combined, verbose=verbose)
-    logger.info(
-        "Discovered %d unique URLs (%d duplicates skipped)",
-        len(all_urls),
-        duplicates_skipped,
-    )
-    return DiscoveryResult(urls=all_urls, duplicates_skipped=duplicates_skipped)
+    return DiscoveryResult(urls=all_urls, stats=stats)

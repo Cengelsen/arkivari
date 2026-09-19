@@ -302,37 +302,43 @@ def archive_urls(
     rate_limiter = ArchiveRateLimiter()
     session = requests.Session()
 
-    for url in urls:
-        if not rate_limiter.can_capture(max_archives):
-            logger.error(
-                "Reached archive cap of %d URLs (anonymous daily limit is %d)",
-                max_archives,
-                ANONYMOUS_DAILY_CAP,
+    try:
+        for url in urls:
+            if not rate_limiter.can_capture(max_archives):
+                logger.error(
+                    "Reached archive cap of %d URLs (anonymous daily limit is %d)",
+                    max_archives,
+                    ANONYMOUS_DAILY_CAP,
+                )
+                break
+
+            if not robots.can_fetch(url):
+                result = ArchiveResult(url=url, status="skipped", error="Disallowed by robots.txt")
+                summary.add(result)
+                if verbose:
+                    logger.info("Skipped (robots.txt): %s", url)
+                continue
+
+            result = archive_url(
+                url,
+                user_agent,
+                rate_limiter,
+                session=session,
+                authenticate=authenticate,
             )
-            break
-
-        if not robots.can_fetch(url):
-            result = ArchiveResult(url=url, status="skipped", error="Disallowed by robots.txt")
             summary.add(result)
+
             if verbose:
-                logger.info("Skipped (robots.txt): %s", url)
-            continue
-
-        result = archive_url(
-            url,
-            user_agent,
-            rate_limiter,
-            session=session,
-            authenticate=authenticate,
+                if result.status == "archived":
+                    logger.info("Archived: %s -> %s", url, result.archive_url)
+                elif result.status == "cached":
+                    logger.info("Already cached: %s -> %s", url, result.archive_url)
+                else:
+                    logger.error("Failed: %s (%s)", url, result.error)
+    except KeyboardInterrupt:
+        logger.warning(
+            "Archive interrupted; %d URL(s) processed in this batch",
+            len(summary.results),
         )
-        summary.add(result)
-
-        if verbose:
-            if result.status == "archived":
-                logger.info("Archived: %s -> %s", url, result.archive_url)
-            elif result.status == "cached":
-                logger.info("Already cached: %s -> %s", url, result.archive_url)
-            else:
-                logger.error("Failed: %s (%s)", url, result.error)
 
     return summary
