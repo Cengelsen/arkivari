@@ -25,6 +25,7 @@ from arkivari.archive import (
 from arkivari.discover import DiscoveryStats, discover_urls, normalize_domain
 from arkivari.queue import ArchiveQueue, default_queue_path
 from arkivari.robots import RobotsPolicy
+from arkivari.validate import ValidationStats, validate_urls
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -97,6 +98,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--user-agent",
         default=DEFAULT_USER_AGENT,
         help="User-Agent string for crawl and archive requests",
+    )
+    parser.add_argument(
+        "--skip-validation",
+        action="store_true",
+        help="Skip link validation (do not check URLs for broken links before queueing)",
     )
     parser.add_argument(
         "--verbose",
@@ -193,6 +199,36 @@ def print_discovery_overview(
         print("  By section:")
         for section, section_count in sorted(sections.items(), key=lambda item: (-item[1], item[0])):
             print(f"    {section_count:>4}  {section}")
+    print()
+
+
+def print_validation_overview(stats: ValidationStats) -> None:
+    """Print a summary of link validation results."""
+    print(f"\nLink validation complete")
+    print(f"  Checked:         {stats.total_checked:,}")
+    print(f"  Included:        {stats.included:,}")
+    if stats.ok:
+        print(f"    OK (2xx):      {stats.ok:,}")
+    if stats.redirected:
+        print(f"    Redirected:    {stats.redirected:,}")
+    if stats.forbidden:
+        print(f"    Forbidden:     {stats.forbidden:,}")
+    if stats.auth_required:
+        print(f"    Auth required: {stats.auth_required:,}")
+    if stats.excluded:
+        print(f"  Excluded:        {stats.excluded:,}")
+    if stats.not_found:
+        print(f"    Not found:     {stats.not_found:,}")
+    if stats.gone:
+        print(f"    Gone (410):    {stats.gone:,}")
+    if stats.soft_404:
+        print(f"    Soft 404:      {stats.soft_404:,}")
+    if stats.rate_limited:
+        print(f"    Rate limited:  {stats.rate_limited:,}")
+    if stats.server_error:
+        print(f"    Server error:  {stats.server_error:,}")
+    if stats.network_error:
+        print(f"    Network error: {stats.network_error:,}")
     print()
 
 
@@ -402,16 +438,41 @@ def main(argv: list[str] | None = None) -> int:
             args.daily_limit,
         )
 
+        validation_stats: ValidationStats | None = None
+        if not args.skip_validation:
+            print(f"Validating {len(discovered_urls):,} discovered links…")
+            log.info("Validating %d discovered URLs…", len(discovered_urls))
+            validation = validate_urls(
+                discovered_urls,
+                session,
+                base_url,
+                args.user_agent,
+                robots,
+                verbose=args.verbose,
+            )
+            validation_stats = validation.stats
+            discovered_urls = validation.urls
+            archivable = _count_archivable(discovered_urls, robots)
+            print_validation_overview(validation_stats)
+
         if args.dry_run:
-            log.info("Dry run: discovered %d URLs (%d archivable)", len(discovered_urls), archivable)
+            log.info(
+                "Dry run: %d URLs after validation (%d archivable)",
+                len(discovered_urls),
+                archivable,
+            )
             return 0
+
+        discovery_dict = asdict(discovery_stats)
+        if validation_stats is not None:
+            discovery_dict["validation"] = asdict(validation_stats)
 
         queue = ArchiveQueue.from_urls(
             base_url,
             discovered_urls,
             robots,
             args.daily_limit,
-            asdict(discovery_stats),
+            discovery_dict,
             existing=existing_queue if args.rediscover else None,
         )
         queue.save(queue_path)
