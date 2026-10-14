@@ -7,7 +7,7 @@ Discover public pages on a domain and archive them to the [Internet Archive](htt
 - Discovers URLs from `robots.txt` sitemaps, `/sitemap.xml`, and HTML link crawling (unlimited by default)
 - Respects `robots.txt` (`Allow`/`Disallow`, `Crawl-delay`, declared sitemaps)
 - Archives pages via Save Page Now (POST + async job polling, same flow as the web UI)
-- **Multi-day scheduling** — queues all archivable URLs and archives up to 4,000 per calendar day
+- **Multi-day scheduling** — queues all archivable URLs and archives up to 4,000 per UTC calendar day (aligned with Save Page Now)
 - Persistent queue file for resuming across daily runs
 - Writes a JSON report after each archive batch
 
@@ -32,7 +32,7 @@ python -m arkivari example.com --dry-run
 # Resume tomorrow (picks up pending queue automatically)
 python -m arkivari example.com --yes
 
-# Run to completion — archives 4k/day and waits overnight automatically
+# Run to completion — uses UTC daily quota and waits after 00:00 UTC when needed
 python -m arkivari example.com --until-complete --yes
 
 # Show queue progress without archiving
@@ -53,19 +53,19 @@ For a site with 80,000 archivable pages:
 2. **Day 2–19:** Run the same command; discovery is skipped and the next 4,000 are archived.
 3. **Day 20:** Final batch completes the queue.
 
-The queue file tracks completed URLs, pending URLs, and today's quota so you cannot accidentally exceed the daily limit by re-running the same day.
+The queue file tracks completed URLs, pending URLs, and per-date quota usage (`archives_by_date`) so you cannot accidentally exceed the daily limit by re-running the same UTC day.
 
-Use `--until-complete` to let a single process handle the full schedule: it archives up to the daily limit, sleeps until the next calendar day, then continues until the queue is empty. Press Ctrl+C to stop safely — progress is saved to the queue file.
+Use `--until-complete` to let a single process run until the queue is empty: it archives while UTC quota remains, waits until **00:00 UTC** (plus 60 seconds) when the daily cap is reached, then continues. Long runs can span multiple UTC days without manual restarts. Press Ctrl+C to stop safely — progress is saved after each capture.
 
 ### Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--max-pages` | 0 (unlimited) | Max total pages to discover (sitemap + crawl) |
-| `--daily-limit` | 4000 | Max URLs to archive per calendar day |
+| `--daily-limit` | 4000 | Max URLs to archive per UTC calendar day |
 | `--queue-file` | `arkivari-queue-<domain>.json` | Persistent queue path |
 | `--rediscover` | off | Re-run discovery and refresh pending URLs |
-| `--until-complete` | off | Archive daily batches until done; waits until midnight between days |
+| `--until-complete` | off | Archive until done; waits when daily UTC quota is used |
 | `--status` | off | Show queue status and exit |
 | `--dry-run` | off | Discover and show schedule only |
 | `--yes`, `-y` | off | Archive without confirmation prompt |
@@ -102,7 +102,7 @@ Authenticated mode (6 captures/min, 100k/day) can be added later via `SAVEPAGENO
 
 ### Queue file (`arkivari-queue-<domain>.json`)
 
-Persists pending URLs, completed archive results, daily limit, and today's quota usage.
+Persists pending URLs, completed archive results, daily limit, and `archives_by_date` (quota used per UTC date). Queue file version is `2`.
 
 ### Batch report (`arkivari-results.json`)
 
@@ -130,7 +130,7 @@ Persists pending URLs, completed archive results, daily limit, and today's quota
 ## Limitations
 
 - **Static HTML only** — JavaScript-rendered SPAs won't be fully discovered
-- **Anonymous IA limits** — large sites require one run per day until the queue is complete
+- **Anonymous IA limits** — quota is per UTC day; use `--until-complete` for continuous multi-day runs or invoke once per UTC day manually
 - **robots.txt is advisory for archiving** — arkivari complies on its side; Internet Archive's own fetch may still be blocked by the target site
 - **No CDX pre-check** — discovers pages first rather than re-archiving URLs Internet Archive already knows about
 - **Failed captures are re-queued** — transient IA errors are retried on a later run

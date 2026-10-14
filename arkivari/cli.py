@@ -6,24 +6,20 @@ import argparse
 import json
 import logging
 import sys
-import time
 from collections import Counter
 from dataclasses import asdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
 
 from arkivari import DEFAULT_USER_AGENT, __version__
-from arkivari.archive import (
-    ANONYMOUS_DAILY_CAP,
-    ArchiveSummary,
-    archive_urls,
-    estimate_archive_seconds,
-)
+from arkivari.archive import ANONYMOUS_DAILY_CAP, ArchiveSummary, estimate_archive_seconds
 from arkivari.discover import DiscoveryStats, discover_urls, normalize_domain
+from arkivari.quota import utc_today_iso
 from arkivari.queue import ArchiveQueue, default_queue_path
+from arkivari.session import run_archive_session
 from arkivari.robots import RobotsPolicy
 from arkivari.validate import ValidationStats, validate_urls
 
@@ -48,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=ANONYMOUS_DAILY_CAP,
         dest="daily_limit",
-        help=f"Maximum URLs to archive per calendar day (default: {ANONYMOUS_DAILY_CAP})",
+        help=f"Maximum URLs to archive per UTC calendar day (default: {ANONYMOUS_DAILY_CAP})",
     )
     parser.add_argument(
         "--max-archives",
@@ -80,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--until-complete",
         action="store_true",
-        help="Keep archiving daily batches until the queue is finished (waits overnight)",
+        help="Archive until the queue is finished; waits when daily UTC quota is used",
     )
     parser.add_argument(
         "--yes",
@@ -244,20 +240,22 @@ def print_queue_overview(queue: ArchiveQueue, stats: DiscoveryStats | None = Non
     print(f"  Total queued:    {queue.total_count:,}")
     print(f"  Completed:       {queue.completed_count:,}")
     print(f"  Pending:         {queue.pending_count:,}")
-    print(f"  Daily limit:     {queue.daily_limit:,}")
+    print(f"  Daily limit:     {queue.daily_limit:,} (UTC calendar day)")
+    print(f"  UTC date:        {utc_today_iso()}")
     today_batch = queue.today_batch_size()
-    print(f"  Today's batch:   {today_batch:,}")
+    print(f"  UTC today batch: {today_batch:,}")
     if queue.pending_count:
         print(f"  Days remaining:  {queue.days_remaining():,}")
-    if queue.archived_today:
-        remaining = queue.remaining_today_quota()
-        print(f"  Archived today:  {queue.archived_today:,} ({remaining:,} remaining)")
+    used_today = queue.archived_today_utc
+    if used_today:
+        remaining = queue.remaining_utc_quota()
+        print(f"  Archived UTC:    {used_today:,} ({remaining:,} remaining today)")
     if today_batch:
         print(f"  Est. duration:   {_format_duration(estimate_archive_seconds(today_batch))}")
     if queue.is_complete():
         print("  Status:          complete")
     elif today_batch == 0 and queue.pending_count:
-        print("  ! Today's daily quota exhausted; run again tomorrow")
+        print("  ! UTC daily quota exhausted; resumes after 00:00 UTC")
     print()
 
 
@@ -280,57 +278,34 @@ def confirm_archive(batch_size: int, until_complete: bool = False, pending: int 
         print("Please answer yes or no.")
 
 
-def seconds_until_midnight() -> float:
-    """Seconds until the next local calendar day."""
-    now = datetime.now()
-    tomorrow = datetime.combine(date.today() + timedelta(days=1), datetime.min.time())
-    return max(0.0, (tomorrow - now).total_seconds())
-
-
-def wait_for_next_day(log: logging.Logger) -> bool:
-    """Sleep until the next local calendar day. Returns False if interrupted."""
-    delay = seconds_until_midnight()
-    if delay <= 0:
-        return True
-
-    resume_at = datetime.now() + timedelta(seconds=delay)
-    log.info(
-        "Daily quota reached; waiting until %s (%s)",
-        resume_at.strftime("%Y-%m-%d %H:%M"),
-        _format_duration(delay),
-    )
-
-    try:
-        end = time.monotonic() + delay
-        while time.monotonic() < end:
-            time.sleep(min(end - time.monotonic(), 300))
-    except KeyboardInterrupt:
-        log.info("Wait interrupted; queue saved — run again to resume")
-        return False
-
-    return True
-
-
-def run_archive_batch(
+def _summary_to_report_dict(
+    archive_summary: ArchiveSummary,
     queue: ArchiveQueue,
-    robots: RobotsPolicy,
-    user_agent: str,
-    batch_size: int,
-    verbose: bool,
-    log: logging.Logger,
-) -> ArchiveSummary:
-    """Archive one batch without removing unprocessed URLs from the queue."""
-    urls_to_archive = queue.peek_batch(batch_size)
-    log.info("Archiving batch of %d URL(s)", len(urls_to_archive))
-    summary = archive_urls(
-        urls_to_archive,
-        robots,
-        user_agent,
-        max_archives=batch_size,
-        verbose=verbose,
-    )
-    queue.finalize_batch(summary.results, batch_size)
-    return summary
+    queue_path: Path,
+    segment: int,
+    until_complete: bool,
+) -> dict:
+    return {
+        "archived_count": archive_summary.archived_count,
+        "cached_count": archive_summary.cached_count,
+        "skipped_robots": archive_summary.skipped_robots,
+        "failed_count": archive_summary.failed_count,
+        "results": [
+            {
+                "url": result.url,
+                "status": result.status,
+                "archive_url": result.archive_url,
+                "error": result.error,
+            }
+            for result in archive_summary.results
+        ],
+        "discovery": queue.discovery,
+        "queue_file": str(queue_path),
+        "segment": segment,
+        "until_complete": until_complete,
+        "quota_utc_date": utc_today_iso(),
+        "archived_today_utc": queue.archived_today_utc,
+    }
 
 
 def write_report(
@@ -492,7 +467,11 @@ def main(argv: list[str] | None = None) -> int:
 
     batch_size = queue.today_batch_size()
     if batch_size == 0 and not args.until_complete:
-        log.info("Today's daily quota (%d) already used; run again tomorrow", args.daily_limit)
+        log.info(
+            "UTC daily quota (%d) already used for %s; run again after 00:00 UTC",
+            args.daily_limit,
+            utc_today_iso(),
+        )
         return 0
 
     if not args.yes:
@@ -506,91 +485,86 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     had_failures = False
-    day_number = 1
 
-    try:
-        while not queue.is_complete():
-            batch_size = queue.today_batch_size()
-            if batch_size == 0:
-                if not args.until_complete:
-                    break
-                if not wait_for_next_day(log):
-                    queue.save(queue_path)
-                    return 130
-                continue
+    def on_segment_complete(archive_summary: ArchiveSummary, segment: int) -> None:
+        nonlocal had_failures
+        if archive_summary.failed_count > 0:
+            had_failures = True
+        summary = _summary_to_report_dict(
+            archive_summary,
+            queue,
+            queue_path,
+            segment,
+            args.until_complete,
+        )
+        write_report(args.output, base_url, queue, summary)
+        log.info(
+            "Segment %d done: %d archived, %d cached, %d skipped (robots), %d failed",
+            segment,
+            archive_summary.archived_count,
+            archive_summary.cached_count,
+            archive_summary.skipped_robots,
+            archive_summary.failed_count,
+        )
+        log.info(
+            "Queue: %d completed, %d pending (%d day(s) remaining); UTC today %d/%d",
+            queue.completed_count,
+            queue.pending_count,
+            queue.days_remaining(),
+            queue.archived_today_utc,
+            queue.daily_limit,
+        )
 
-            if args.until_complete:
-                log.info(
-                    "Day %d: %d pending, archiving up to %d",
-                    day_number,
-                    queue.pending_count,
-                    batch_size,
-                )
+    if args.until_complete:
+        log.info(
+            "Until complete: %d pending, up to %d per UTC day",
+            queue.pending_count,
+            queue.daily_limit,
+        )
+    else:
+        log.info("Archiving up to %d URL(s) for UTC %s", batch_size, utc_today_iso())
 
-            archive_summary = run_archive_batch(
-                queue,
-                robots,
-                args.user_agent,
-                batch_size,
-                args.verbose,
-                log,
-            )
-            queue.save(queue_path)
+    outcome = run_archive_session(
+        queue,
+        queue_path,
+        robots,
+        args.user_agent,
+        until_complete=args.until_complete,
+        verbose=args.verbose,
+        log=log,
+        on_segment_complete=on_segment_complete if args.until_complete else None,
+    )
 
-            summary: dict = {
-                "archived_count": archive_summary.archived_count,
-                "cached_count": archive_summary.cached_count,
-                "skipped_robots": archive_summary.skipped_robots,
-                "failed_count": archive_summary.failed_count,
-                "results": [
-                    {
-                        "url": result.url,
-                        "status": result.status,
-                        "archive_url": result.archive_url,
-                        "error": result.error,
-                    }
-                    for result in archive_summary.results
-                ],
-                "discovery": queue.discovery,
-                "queue_file": str(queue_path),
-                "day": day_number,
-                "until_complete": args.until_complete,
-            }
-            write_report(args.output, base_url, queue, summary)
-
-            log.info(
-                "Batch done: %d archived, %d cached, %d skipped (robots), %d failed",
-                archive_summary.archived_count,
-                archive_summary.cached_count,
-                archive_summary.skipped_robots,
-                archive_summary.failed_count,
-            )
-            log.info(
-                "Queue: %d completed, %d pending (%d day(s) remaining)",
-                queue.completed_count,
-                queue.pending_count,
-                queue.days_remaining(),
-            )
-
-            if archive_summary.failed_count > 0:
-                had_failures = True
-
-            if not args.until_complete:
-                break
-
-            day_number += 1
-            if queue.is_complete():
-                break
-            if not wait_for_next_day(log):
-                queue.save(queue_path)
-                return 130
-
-    except KeyboardInterrupt:
-        queue.save(queue_path)
-        log.info("Interrupted; queue saved to %s", queue_path)
+    if outcome.interrupted:
         return 130
 
-    log.info("Archive queue complete (%d URLs archived)", queue.completed_count)
+    if not args.until_complete and outcome.summary.results:
+        if outcome.summary.failed_count > 0:
+            had_failures = True
+        summary = _summary_to_report_dict(
+            outcome.summary,
+            queue,
+            queue_path,
+            1,
+            args.until_complete,
+        )
+        write_report(args.output, base_url, queue, summary)
+        log.info(
+            "Batch done: %d archived, %d cached, %d skipped (robots), %d failed",
+            outcome.summary.archived_count,
+            outcome.summary.cached_count,
+            outcome.summary.skipped_robots,
+            outcome.summary.failed_count,
+        )
+        log.info(
+            "Queue: %d completed, %d pending (%d day(s) remaining)",
+            queue.completed_count,
+            queue.pending_count,
+            queue.days_remaining(),
+        )
+
+    if queue.is_complete():
+        log.info("Archive queue complete (%d URLs archived)", queue.completed_count)
     log.info("Wrote report to %s", args.output)
 
     if had_failures:

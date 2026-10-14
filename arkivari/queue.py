@@ -6,14 +6,15 @@ import json
 import math
 import re
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from arkivari.archive import ANONYMOUS_DAILY_CAP, ArchiveResult
+from arkivari.quota import utc_today_iso
 from arkivari.robots import RobotsPolicy
 
-QUEUE_VERSION = 1
+QUEUE_VERSION = 2
 
 
 @dataclass
@@ -33,8 +34,7 @@ class ArchiveQueue:
     daily_limit: int = ANONYMOUS_DAILY_CAP
     created_at: str = ""
     updated_at: str = ""
-    last_archive_date: str = ""
-    archived_today: int = 0
+    archives_by_date: dict[str, int] = field(default_factory=dict)
     discovery: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -60,19 +60,28 @@ class ArchiveQueue:
     def total_count(self) -> int:
         return self.pending_count + self.completed_count
 
+    @property
+    def archived_today_utc(self) -> int:
+        return self.quota_used_on(utc_today_iso())
+
     def days_remaining(self) -> int:
         if not self.pending:
             return 0
         return math.ceil(self.pending_count / self.daily_limit)
 
+    def quota_used_on(self, iso_date: str) -> int:
+        return self.archives_by_date.get(iso_date, 0)
+
+    def remaining_utc_quota(self) -> int:
+        today = utc_today_iso()
+        return max(0, self.daily_limit - self.quota_used_on(today))
+
     def remaining_today_quota(self) -> int:
-        today = date.today().isoformat()
-        if self.last_archive_date != today:
-            return self.daily_limit
-        return max(0, self.daily_limit - self.archived_today)
+        """Alias for remaining UTC quota (Save Page Now uses UTC calendar days)."""
+        return self.remaining_utc_quota()
 
     def today_batch_size(self) -> int:
-        return min(self.pending_count, self.remaining_today_quota())
+        return min(self.pending_count, self.remaining_utc_quota())
 
     def is_complete(self) -> bool:
         return not self.pending
@@ -80,41 +89,48 @@ class ArchiveQueue:
     def peek_batch(self, size: int) -> list[str]:
         return self.pending[:size]
 
-    def finalize_batch(self, results: list[ArchiveResult], batch_size: int) -> None:
-        """Apply archive results for the first batch_size pending URLs."""
-        today = date.today().isoformat()
-        if self.last_archive_date != today:
-            self.last_archive_date = today
-            self.archived_today = 0
+    def _bump_quota_for_today(self) -> None:
+        today = utc_today_iso()
+        self.archives_by_date[today] = self.quota_used_on(today) + 1
 
-        batch_urls = set(self.pending[:batch_size])
-        results_by_url = {result.url: result for result in results}
+    def apply_robots_skip(self, result: ArchiveResult) -> None:
+        """Remove a robots-disallowed URL from pending without using daily quota."""
+        if not self.pending or self.pending[0] != result.url:
+            return
         now = datetime.now(timezone.utc).isoformat()
-        still_pending: list[str] = []
-
-        for url in self.pending:
-            if url not in batch_urls:
-                still_pending.append(url)
-                continue
-
-            result = results_by_url.get(url)
-            if result is None or result.status == "failed":
-                still_pending.append(url)
-                continue
-
-            self.completed.append(
-                CompletedEntry(
-                    url=url,
-                    status=result.status,
-                    archive_url=result.archive_url,
-                    error=result.error,
-                    archived_at=now,
-                )
+        self.pending.pop(0)
+        self.completed.append(
+            CompletedEntry(
+                url=result.url,
+                status=result.status,
+                archive_url=result.archive_url,
+                error=result.error,
+                archived_at=now,
             )
-            if result.status in ("archived", "cached"):
-                self.archived_today += 1
+        )
+        self.updated_at = now
 
-        self.pending = still_pending
+    def apply_archive_result(self, result: ArchiveResult) -> None:
+        """Apply a single archive result for the head of the pending queue."""
+        if not self.pending or self.pending[0] != result.url:
+            return
+
+        if result.status == "failed":
+            return
+
+        now = datetime.now(timezone.utc).isoformat()
+        self.pending.pop(0)
+        self.completed.append(
+            CompletedEntry(
+                url=result.url,
+                status=result.status,
+                archive_url=result.archive_url,
+                error=result.error,
+                archived_at=now,
+            )
+        )
+        if result.status in ("archived", "cached"):
+            self._bump_quota_for_today()
         self.updated_at = now
 
     def save(self, path: Path) -> None:
@@ -124,8 +140,7 @@ class ArchiveQueue:
             "created_at": self.created_at,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "daily_limit": self.daily_limit,
-            "last_archive_date": self.last_archive_date,
-            "archived_today": self.archived_today,
+            "archives_by_date": self.archives_by_date,
             "pending": self.pending,
             "completed": [asdict(entry) for entry in self.completed],
             "discovery": self.discovery,
@@ -136,6 +151,13 @@ class ArchiveQueue:
     def load(cls, path: Path) -> ArchiveQueue:
         data = json.loads(path.read_text(encoding="utf-8"))
         completed = [CompletedEntry(**entry) for entry in data.get("completed", [])]
+        archives_by_date: dict[str, int] = dict(data.get("archives_by_date", {}))
+        if not archives_by_date:
+            legacy_date = data.get("last_archive_date", "")
+            legacy_count = data.get("archived_today", 0)
+            if legacy_date and legacy_count:
+                archives_by_date[legacy_date] = legacy_count
+
         return cls(
             domain=data["domain"],
             pending=list(data.get("pending", [])),
@@ -143,8 +165,7 @@ class ArchiveQueue:
             daily_limit=data.get("daily_limit", ANONYMOUS_DAILY_CAP),
             created_at=data.get("created_at", ""),
             updated_at=data.get("updated_at", ""),
-            last_archive_date=data.get("last_archive_date", ""),
-            archived_today=data.get("archived_today", 0),
+            archives_by_date=archives_by_date,
             discovery=data.get("discovery", {}),
         )
 
@@ -178,6 +199,7 @@ class ArchiveQueue:
             completed=completed,
             daily_limit=daily_limit,
             created_at=existing.created_at if existing else "",
+            archives_by_date=dict(existing.archives_by_date) if existing else {},
             discovery=discovery,
         )
         discovery["skipped_robots_at_queue"] = skipped_robots
