@@ -15,12 +15,24 @@ from urllib.parse import urlparse
 import requests
 
 from arkivari import DEFAULT_USER_AGENT, __version__
-from arkivari.archive import ANONYMOUS_DAILY_CAP, ArchiveSummary, estimate_archive_seconds
+from arkivari.archive import (
+    ANONYMOUS_DAILY_CAP,
+    MIN_INTERVAL_SECONDS,
+    ArchiveSummary,
+    estimate_archive_seconds,
+)
 from arkivari.discover import DiscoveryStats, discover_urls, normalize_domain
 from arkivari.quota import utc_today_iso
 from arkivari.queue import ArchiveQueue, default_queue_path
 from arkivari.session import run_archive_session
 from arkivari.robots import RobotsPolicy
+from arkivari.spn_config import (
+    AUTHENTICATED_DAILY_CAP,
+    SpnConfig,
+    load_dotenv,
+    resolve_daily_limit,
+    resolve_spn_config,
+)
 from arkivari.validate import ValidationStats, validate_urls
 
 
@@ -42,9 +54,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--daily-limit",
         type=int,
-        default=ANONYMOUS_DAILY_CAP,
+        default=None,
         dest="daily_limit",
-        help=f"Maximum URLs to archive per UTC calendar day (default: {ANONYMOUS_DAILY_CAP})",
+        help=(
+            f"Maximum URLs to archive per UTC calendar day "
+            f"(default: {AUTHENTICATED_DAILY_CAP:,} with S3 keys, {ANONYMOUS_DAILY_CAP:,} anonymous)"
+        ),
+    )
+    parser.add_argument(
+        "--anonymous",
+        action="store_true",
+        help="Force anonymous Save Page Now even if SAVEPAGENOW_* keys are set",
     )
     parser.add_argument(
         "--max-archives",
@@ -163,6 +183,7 @@ def print_discovery_overview(
     archivable_count: int,
     stats: DiscoveryStats,
     daily_limit: int,
+    spn_config: SpnConfig,
 ) -> None:
     """Print a summary of discovered URLs before queueing."""
     count = len(discovered_urls)
@@ -185,7 +206,9 @@ def print_discovery_overview(
     print(f"  Archivable:      {archivable_count:,}")
     if archivable_count:
         print(f"  Schedule:        {days:,} day(s) at {daily_limit:,}/day")
-        print(f"  Day 1 duration:  {_format_duration(estimate_archive_seconds(min(archivable_count, daily_limit)))}")
+        print(
+            f"  Day 1 duration:  {_format_duration(estimate_archive_seconds(min(archivable_count, daily_limit), spn_config.min_interval_seconds))}"
+        )
 
     for warning in _discovery_warnings(stats, archivable_count):
         print(f"  ! {warning}")
@@ -228,9 +251,18 @@ def print_validation_overview(stats: ValidationStats) -> None:
     print()
 
 
-def print_queue_overview(queue: ArchiveQueue, stats: DiscoveryStats | None = None) -> None:
+def print_queue_overview(
+    queue: ArchiveQueue,
+    stats: DiscoveryStats | None = None,
+    spn_config: SpnConfig | None = None,
+) -> None:
     """Print the current archive schedule and progress."""
     print(f"\nArchive schedule for {queue.domain}")
+    if spn_config:
+        print(
+            f"  SPN mode:        {spn_config.mode_label} "
+            f"({spn_config.daily_cap:,}/day, {spn_config.captures_per_minute}/min)"
+        )
     if stats:
         print(f"  Discovered:      {queue.total_count + stats.duplicates_skipped:,}", end="")
         skipped = queue.discovery.get("skipped_robots_at_queue", 0)
@@ -251,7 +283,10 @@ def print_queue_overview(queue: ArchiveQueue, stats: DiscoveryStats | None = Non
         remaining = queue.remaining_utc_quota()
         print(f"  Archived UTC:    {used_today:,} ({remaining:,} remaining today)")
     if today_batch:
-        print(f"  Est. duration:   {_format_duration(estimate_archive_seconds(today_batch))}")
+        interval = spn_config.min_interval_seconds if spn_config else MIN_INTERVAL_SECONDS
+        print(
+            f"  Est. duration:   {_format_duration(estimate_archive_seconds(today_batch, interval))}"
+        )
     if queue.is_complete():
         print("  Status:          complete")
     elif today_batch == 0 and queue.pending_count:
@@ -284,6 +319,7 @@ def _summary_to_report_dict(
     queue_path: Path,
     segment: int,
     until_complete: bool,
+    spn_config: SpnConfig,
 ) -> dict:
     return {
         "archived_count": archive_summary.archived_count,
@@ -305,7 +341,27 @@ def _summary_to_report_dict(
         "until_complete": until_complete,
         "quota_utc_date": utc_today_iso(),
         "archived_today_utc": queue.archived_today_utc,
+        "spn_mode": spn_config.mode_label,
     }
+
+
+def _log_spn_mode(log: logging.Logger, spn_config: SpnConfig) -> None:
+    log.info(
+        "Save Page Now: %s (%s/day, %s/min)",
+        spn_config.mode_label,
+        f"{spn_config.daily_cap:,}",
+        spn_config.captures_per_minute,
+    )
+
+
+def _apply_daily_limit_to_queue(
+    queue: ArchiveQueue,
+    daily_limit: int,
+    queue_path: Path,
+) -> None:
+    if queue.daily_limit != daily_limit:
+        queue.daily_limit = daily_limit
+        queue.save(queue_path)
 
 
 def write_report(
@@ -336,13 +392,19 @@ def _count_archivable(urls: list[str], robots: RobotsPolicy) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
+    argv = argv if argv is not None else sys.argv[1:]
     args = parser.parse_args(argv)
+
+    load_dotenv()
+    spn_config = resolve_spn_config(force_anonymous=args.anonymous)
+    user_set_daily_limit = "--daily-limit" in argv or "--max-archives" in argv
 
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(levelname)s: %(message)s",
     )
     log = logging.getLogger("arkivari")
+    _log_spn_mode(log, spn_config)
 
     try:
         base_url = normalize_domain(args.domain)
@@ -367,7 +429,14 @@ def main(argv: list[str] | None = None) -> int:
         if existing_queue is None:
             log.error("No queue file found at %s", queue_path)
             return 2
-        print_queue_overview(existing_queue)
+        status_limit = resolve_daily_limit(
+            args.daily_limit,
+            spn_config,
+            existing_queue.daily_limit,
+            user_set_daily_limit=user_set_daily_limit,
+        )
+        _apply_daily_limit_to_queue(existing_queue, status_limit, queue_path)
+        print_queue_overview(existing_queue, spn_config=spn_config)
         return 0
 
     discovery_stats: DiscoveryStats | None = None
@@ -381,8 +450,16 @@ def main(argv: list[str] | None = None) -> int:
         and not args.dry_run
     )
 
+    daily_limit = resolve_daily_limit(
+        args.daily_limit,
+        spn_config,
+        existing_queue.daily_limit if existing_queue else None,
+        user_set_daily_limit=user_set_daily_limit,
+    )
+
     if resume:
         queue = existing_queue
+        _apply_daily_limit_to_queue(queue, daily_limit, queue_path)
         log.info("Resuming queue from %s (%d pending)", queue_path, queue.pending_count)
     else:
         try:
@@ -410,7 +487,8 @@ def main(argv: list[str] | None = None) -> int:
             discovered_urls,
             archivable,
             discovery_stats,
-            args.daily_limit,
+            daily_limit,
+            spn_config,
         )
 
         validation_stats: ValidationStats | None = None
@@ -446,16 +524,16 @@ def main(argv: list[str] | None = None) -> int:
             base_url,
             discovered_urls,
             robots,
-            args.daily_limit,
+            daily_limit,
             discovery_dict,
             existing=existing_queue if args.rediscover else None,
         )
         queue.save(queue_path)
         log.info("Wrote queue with %d pending URLs to %s", queue.pending_count, queue_path)
-        print_queue_overview(queue, discovery_stats)
+        print_queue_overview(queue, discovery_stats, spn_config=spn_config)
 
     if resume:
-        print_queue_overview(queue, discovery_stats)
+        print_queue_overview(queue, discovery_stats, spn_config=spn_config)
 
     if queue.is_complete():
         log.info("Archive queue complete (%d URLs archived)", queue.completed_count)
@@ -469,7 +547,7 @@ def main(argv: list[str] | None = None) -> int:
     if batch_size == 0 and not args.until_complete:
         log.info(
             "UTC daily quota (%d) already used for %s; run again after 00:00 UTC",
-            args.daily_limit,
+            queue.daily_limit,
             utc_today_iso(),
         )
         return 0
@@ -477,7 +555,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.yes:
         confirm_size = queue.pending_count if args.until_complete else batch_size
         if not confirm_archive(
-            args.daily_limit,
+            queue.daily_limit,
             until_complete=args.until_complete,
             pending=confirm_size,
         ):
@@ -496,6 +574,7 @@ def main(argv: list[str] | None = None) -> int:
             queue_path,
             segment,
             args.until_complete,
+            spn_config,
         )
         write_report(args.output, base_url, queue, summary)
         log.info(
@@ -522,7 +601,11 @@ def main(argv: list[str] | None = None) -> int:
             queue.daily_limit,
         )
     else:
-        log.info("Archiving up to %d URL(s) for UTC %s", batch_size, utc_today_iso())
+        log.info(
+            "Archiving up to %d URL(s) for UTC %s",
+            batch_size,
+            utc_today_iso(),
+        )
 
     outcome = run_archive_session(
         queue,
@@ -532,6 +615,7 @@ def main(argv: list[str] | None = None) -> int:
         until_complete=args.until_complete,
         verbose=args.verbose,
         log=log,
+        spn_config=spn_config,
         on_segment_complete=on_segment_complete if args.until_complete else None,
     )
 
@@ -547,6 +631,7 @@ def main(argv: list[str] | None = None) -> int:
             queue_path,
             1,
             args.until_complete,
+            spn_config,
         )
         write_report(args.output, base_url, queue, summary)
         log.info(

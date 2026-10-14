@@ -4,3 +4,4 @@ __pycache__/
 arkivari-results.json
 arkivari-queue-*.json
 .pytest_cache/
+.env

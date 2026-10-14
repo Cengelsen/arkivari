@@ -1,0 +1,115 @@
+"""Save Page Now configuration and Internet Archive S3 credentials."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+ACCESS_KEY_ENV = "SAVEPAGENOW_ACCESS_KEY"
+ANONYMOUS_CAPTURES_PER_MINUTE = 3
+ANONYMOUS_DAILY_CAP = 4000
+SECRET_KEY_ENV = "SAVEPAGENOW_SECRET_KEY"
+
+AUTHENTICATED_CAPTURES_PER_MINUTE = 7
+AUTHENTICATED_DAILY_CAP = 100_000
+IF_NOT_ARCHIVED_WITHIN = "30m"
+
+
+@dataclass(frozen=True)
+class SpnConfig:
+    authenticated: bool
+    access_key: str | None
+    secret_key: str | None
+    captures_per_minute: int
+    daily_cap: int
+    min_interval_seconds: float
+    if_not_archived_within: str = IF_NOT_ARCHIVED_WITHIN
+
+    @property
+    def mode_label(self) -> str:
+        return "authenticated" if self.authenticated else "anonymous"
+
+
+def load_dotenv(path: Path | None = None) -> None:
+    """Load environment variables from a .env file into os.environ (no override)."""
+    env_path = path or Path.cwd() / ".env"
+    if not env_path.is_file():
+        return
+
+    try:
+        from dotenv import load_dotenv as _dotenv_load
+
+        _dotenv_load(env_path, override=False)
+        return
+    except ImportError:
+        pass
+
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'").strip('"')
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def resolve_spn_config(force_anonymous: bool = False) -> SpnConfig:
+    """Build SPN config from environment (call load_dotenv first)."""
+    if force_anonymous:
+        return _anonymous_config()
+
+    access_key = os.environ.get(ACCESS_KEY_ENV, "").strip()
+    secret_key = os.environ.get(SECRET_KEY_ENV, "").strip()
+    if access_key and secret_key:
+        interval = 60.0 / AUTHENTICATED_CAPTURES_PER_MINUTE
+        return SpnConfig(
+            authenticated=True,
+            access_key=access_key,
+            secret_key=secret_key,
+            captures_per_minute=AUTHENTICATED_CAPTURES_PER_MINUTE,
+            daily_cap=AUTHENTICATED_DAILY_CAP,
+            min_interval_seconds=interval,
+        )
+    return _anonymous_config()
+
+
+def _anonymous_config() -> SpnConfig:
+    return SpnConfig(
+        authenticated=False,
+        access_key=None,
+        secret_key=None,
+        captures_per_minute=ANONYMOUS_CAPTURES_PER_MINUTE,
+        daily_cap=ANONYMOUS_DAILY_CAP,
+        min_interval_seconds=60.0 / ANONYMOUS_CAPTURES_PER_MINUTE,
+    )
+
+
+def authorization_header(config: SpnConfig) -> str:
+    if not config.authenticated or not config.access_key or not config.secret_key:
+        raise ValueError("authorization_header requires authenticated SpnConfig with keys")
+    return f"LOW {config.access_key}:{config.secret_key}"
+
+
+def resolve_daily_limit(
+    cli_daily_limit: int | None,
+    spn_config: SpnConfig,
+    queue_daily_limit: int | None = None,
+    user_set_daily_limit: bool = False,
+) -> int:
+    """
+    Pick effective UTC daily archive cap.
+
+    user_set_daily_limit is True when the user passed --daily-limit on the CLI.
+    """
+    if user_set_daily_limit and cli_daily_limit is not None:
+        return cli_daily_limit
+    if queue_daily_limit is not None:
+        if spn_config.authenticated and queue_daily_limit == ANONYMOUS_DAILY_CAP:
+            return AUTHENTICATED_DAILY_CAP
+        return queue_daily_limit
+    return spn_config.daily_cap

@@ -75,19 +75,24 @@ Use `--until-complete` to let a single process run until the queue is empty: it 
 
 Exit codes: `0` success, `1` partial failure (some archives failed), `2` fatal error.
 
-## Internet Archive limits (anonymous)
+## Internet Archive limits
 
-arkivari enforces these Save Page Now limits when running without credentials:
+arkivari loads optional credentials from a `.env` file (gitignored) or the environment. When both `SAVEPAGENOW_ACCESS_KEY` and `SAVEPAGENOW_SECRET_KEY` are set, it uses the [SPN2 API](https://archive.org/account/s3.php) automatically (`Authorization: LOW access:secret`). Use `--anonymous` to force anonymous mode.
 
-| Limit | Value |
-|-------|-------|
-| Captures per minute | 3 |
-| Captures per day | 4,000 |
-| Concurrent captures | 1 (sequential) |
+Create S3 keys at [archive.org/account/s3.php](https://archive.org/account/s3.php) (same keys as IA-S3 uploads). Never commit keys to git.
 
-Recently archived URLs are returned as cached snapshots rather than re-captured. This counts as success and saves quota.
+| Mode | Captures / minute | Captures / UTC day | Notes |
+|------|-------------------|--------------------|--------|
+| Anonymous | 3 | 4,000 | Default without keys |
+| Authenticated | 7 | 100,000 | Auto when keys are set |
 
-Authenticated mode (6 captures/min, 100k/day) can be added later via `SAVEPAGENOW_ACCESS_KEY` and `SAVEPAGENOW_SECRET_KEY` environment variables.
+arkivari runs captures **sequentially** (one at a time). Internet Archive also limits concurrent pending jobs (12 authenticated) and **10 captures per URL per UTC day**.
+
+Authenticated submits use `capture_all=1`, `skip_first_archive=1`, and `if_not_archived_within=30m` so recent captures count as cached without a full re-capture when possible.
+
+Resuming a queue file that still has `daily_limit: 4000` will upgrade to 100,000 when S3 keys are present (unless you pass `--daily-limit`).
+
+Recently archived URLs are returned as cached snapshots rather than re-captured. This counts toward your daily quota.
 
 ## robots.txt behavior
 

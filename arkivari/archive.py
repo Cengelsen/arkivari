@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -12,10 +13,12 @@ from typing import Any, Literal
 import requests
 
 from arkivari.robots import RobotsPolicy
+from arkivari.spn_config import SpnConfig, authorization_header
 
 logger = logging.getLogger(__name__)
 
 SAVE_PAGE_URL = "https://web.archive.org/save/"
+SAVE_PAGE_API = "https://web.archive.org/save"
 WAYBACK_BASE = "https://web.archive.org"
 
 ANONYMOUS_CAPTURES_PER_MINUTE = 3
@@ -27,11 +30,14 @@ POLL_INTERVAL_SECONDS = 3.0
 MAX_POLL_SECONDS = 120.0
 
 
-def estimate_archive_seconds(page_count: int) -> float:
-    """Estimate wall-clock time to archive pages at anonymous IA rate limits."""
+def estimate_archive_seconds(
+    page_count: int,
+    min_interval_seconds: float = MIN_INTERVAL_SECONDS,
+) -> float:
+    """Estimate wall-clock time to archive pages at IA rate limits."""
     if page_count <= 0:
         return 0.0
-    per_page = MIN_INTERVAL_SECONDS + ESTIMATED_CAPTURE_SECONDS
+    per_page = min_interval_seconds + ESTIMATED_CAPTURE_SECONDS
     return ESTIMATED_CAPTURE_SECONDS + (page_count - 1) * per_page
 
 JOB_ID_PATTERN = re.compile(r'watchJob\("([^"]+)"')
@@ -69,15 +75,16 @@ class ArchiveSummary:
 
 
 class ArchiveRateLimiter:
-    """Enforce anonymous Save Page Now rate limits."""
+    """Enforce Save Page Now per-minute rate limits."""
 
-    def __init__(self) -> None:
+    def __init__(self, min_interval_seconds: float = MIN_INTERVAL_SECONDS) -> None:
+        self._min_interval_seconds = min_interval_seconds
         self._last_capture_at = 0.0
         self._capture_count = 0
 
     def wait(self) -> None:
         elapsed = time.monotonic() - self._last_capture_at
-        remaining = MIN_INTERVAL_SECONDS - elapsed
+        remaining = self._min_interval_seconds - elapsed
         if remaining > 0:
             time.sleep(remaining)
         self._last_capture_at = time.monotonic()
@@ -109,15 +116,26 @@ def _extract_html_error_message(html: str) -> str | None:
     return None
 
 
-def _browser_headers(user_agent: str) -> dict[str, str]:
-    return {
+def _browser_headers(user_agent: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+    headers = {
         "User-Agent": user_agent,
         "Referer": SAVE_PAGE_URL,
     }
+    if extra:
+        headers.update(extra)
+    return headers
 
 
 def _build_archive_url(timestamp: str, original_url: str) -> str:
     return f"{WAYBACK_BASE}/web/{timestamp}/{original_url}"
+
+
+def _format_job_error(payload: dict[str, Any]) -> str:
+    message = payload.get("message") or "Capture failed"
+    status_ext = payload.get("status_ext")
+    if status_ext:
+        return f"{status_ext}: {message}"
+    return str(message)
 
 
 def _parse_submit_response(html: str) -> tuple[str | None, str | None]:
@@ -128,7 +146,7 @@ def _parse_submit_response(html: str) -> tuple[str | None, str | None]:
     return job_id, message
 
 
-def _submit_capture(
+def _submit_capture_anonymous(
     session: requests.Session,
     url: str,
     user_agent: str,
@@ -158,24 +176,73 @@ def _submit_capture(
     return job_id, message
 
 
+def _submit_capture_authenticated(
+    session: requests.Session,
+    url: str,
+    user_agent: str,
+    spn_config: SpnConfig,
+) -> tuple[str, str | None]:
+    """Submit a capture via SPN2 JSON API."""
+    headers = _browser_headers(
+        user_agent,
+        {
+            "Accept": "application/json",
+            "Authorization": authorization_header(spn_config),
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        },
+    )
+    data = {
+        "url": url,
+        "capture_all": "1",
+        "skip_first_archive": "1",
+        "if_not_archived_within": spn_config.if_not_archived_within,
+    }
+    response = session.post(SAVE_PAGE_API, data=data, headers=headers, timeout=30)
+
+    if response.status_code == 429:
+        raise SpnError("Rate limited by Internet Archive (HTTP 429)")
+
+    if response.status_code >= 400:
+        snippet = response.text[:200].replace("\n", " ")
+        raise SpnError(f"HTTP {response.status_code}: {snippet}")
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        snippet = response.text[:200].replace("\n", " ")
+        raise SpnError(f"Invalid JSON from Internet Archive: {snippet}") from exc
+
+    job_id = payload.get("job_id")
+    if not job_id:
+        raise SpnError(f"No capture job returned: {json.dumps(payload)[:_MAX_ERROR_LENGTH]}")
+
+    message = payload.get("message")
+    return str(job_id), message if isinstance(message, str) else None
+
+
 def _poll_capture(
     session: requests.Session,
     job_id: str,
     user_agent: str,
+    spn_config: SpnConfig,
+    min_interval_seconds: float,
 ) -> dict[str, Any]:
     """Poll job status until success, error, or timeout."""
     deadline = time.monotonic() + MAX_POLL_SECONDS
+    poll_headers = _browser_headers(user_agent, {"Accept": "application/json"})
+    if spn_config.authenticated:
+        poll_headers["Authorization"] = authorization_header(spn_config)
 
     while time.monotonic() < deadline:
         response = session.get(
             f"{SAVE_PAGE_URL}status/{job_id}",
             params={"_t": int(time.time() * 1000)},
-            headers=_browser_headers(user_agent),
+            headers=poll_headers,
             timeout=30,
         )
 
         if response.status_code == 429:
-            time.sleep(MIN_INTERVAL_SECONDS)
+            time.sleep(min_interval_seconds)
             continue
 
         if response.status_code >= 400:
@@ -199,22 +266,22 @@ def _is_cached_message(message: str | None) -> bool:
     if not message:
         return False
     lowered = message.lower()
-    return "same snapshot" in lowered or "already been archived" in lowered
+    return (
+        "same snapshot" in lowered
+        or "already been archived" in lowered
+        or "recent capture" in lowered
+    )
 
 
-def _run_capture(
-    session: requests.Session,
+def _payload_to_result(
     url: str,
-    user_agent: str,
+    payload: dict[str, Any],
+    submit_message: str | None,
 ) -> ArchiveResult:
-    """Archive a URL via POST submit and async status polling."""
-    job_id, submit_message = _submit_capture(session, url, user_agent)
-    payload = _poll_capture(session, job_id, user_agent)
-
     status = payload.get("status")
     if status == "error":
-        error = payload.get("message") or payload.get("status_ext") or "Capture failed"
-        return ArchiveResult(url=url, status="failed", error=str(error)[:_MAX_ERROR_LENGTH])
+        error = _format_job_error(payload)
+        return ArchiveResult(url=url, status="failed", error=error[:_MAX_ERROR_LENGTH])
 
     if status != "success":
         return ArchiveResult(
@@ -229,8 +296,34 @@ def _run_capture(
         return ArchiveResult(url=url, status="failed", error="Capture succeeded but no timestamp returned")
 
     archive_url = _build_archive_url(timestamp, original_url)
-    result_status: ArchiveStatus = "cached" if _is_cached_message(submit_message) else "archived"
+    job_message = payload.get("message")
+    hint = submit_message or (str(job_message) if job_message else None)
+    result_status: ArchiveStatus = "cached" if _is_cached_message(hint) else "archived"
     return ArchiveResult(url=url, status=result_status, archive_url=archive_url)
+
+
+def _run_capture(
+    session: requests.Session,
+    url: str,
+    user_agent: str,
+    spn_config: SpnConfig,
+) -> ArchiveResult:
+    """Archive a URL via POST submit and async status polling."""
+    if spn_config.authenticated:
+        job_id, submit_message = _submit_capture_authenticated(session, url, user_agent, spn_config)
+    else:
+        job_id, submit_message = _submit_capture_anonymous(session, url, user_agent)
+        if not job_id:
+            return ArchiveResult(url=url, status="failed", error="No capture job returned")
+
+    payload = _poll_capture(
+        session,
+        job_id,
+        user_agent,
+        spn_config,
+        spn_config.min_interval_seconds,
+    )
+    return _payload_to_result(url, payload, submit_message)
 
 
 def archive_url(
@@ -238,23 +331,24 @@ def archive_url(
     user_agent: str,
     rate_limiter: ArchiveRateLimiter,
     session: requests.Session | None = None,
-    authenticate: bool = False,
+    spn_config: SpnConfig | None = None,
 ) -> ArchiveResult:
     """Archive a single URL via Save Page Now."""
-    if authenticate:
-        return ArchiveResult(
-            url=url,
-            status="failed",
-            error="Authenticated mode is not implemented yet",
-        )
-
+    config = spn_config or SpnConfig(
+        authenticated=False,
+        access_key=None,
+        secret_key=None,
+        captures_per_minute=ANONYMOUS_CAPTURES_PER_MINUTE,
+        daily_cap=ANONYMOUS_DAILY_CAP,
+        min_interval_seconds=MIN_INTERVAL_SECONDS,
+    )
     http = session or requests.Session()
-    backoff = MIN_INTERVAL_SECONDS
+    backoff = config.min_interval_seconds
 
     for attempt in range(1, MAX_RETRIES + 1):
         rate_limiter.wait()
         try:
-            result = _run_capture(http, url, user_agent)
+            result = _run_capture(http, url, user_agent, config)
             rate_limiter.record_capture()
             return result
 
@@ -295,20 +389,30 @@ def archive_urls(
     user_agent: str,
     max_archives: int = ANONYMOUS_DAILY_CAP,
     verbose: bool = False,
-    authenticate: bool = False,
+    spn_config: SpnConfig | None = None,
 ) -> ArchiveSummary:
     """Archive discovered URLs while respecting robots.txt and IA limits."""
+    config = spn_config
+    if config is None:
+        config = SpnConfig(
+            authenticated=False,
+            access_key=None,
+            secret_key=None,
+            captures_per_minute=ANONYMOUS_CAPTURES_PER_MINUTE,
+            daily_cap=ANONYMOUS_DAILY_CAP,
+            min_interval_seconds=MIN_INTERVAL_SECONDS,
+        )
     summary = ArchiveSummary()
-    rate_limiter = ArchiveRateLimiter()
+    rate_limiter = ArchiveRateLimiter(config.min_interval_seconds)
     session = requests.Session()
 
     try:
         for url in urls:
             if not rate_limiter.can_capture(max_archives):
                 logger.error(
-                    "Reached archive cap of %d URLs (anonymous daily limit is %d)",
+                    "Reached archive cap of %d URLs (daily limit is %d)",
                     max_archives,
-                    ANONYMOUS_DAILY_CAP,
+                    config.daily_cap,
                 )
                 break
 
@@ -324,7 +428,7 @@ def archive_urls(
                 user_agent,
                 rate_limiter,
                 session=session,
-                authenticate=authenticate,
+                spn_config=config,
             )
             summary.add(result)
 

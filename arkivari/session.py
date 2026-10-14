@@ -13,12 +13,15 @@ from arkivari.archive import ArchiveRateLimiter, ArchiveResult, ArchiveSummary, 
 from arkivari.quota import wait_for_utc_quota_reset
 from arkivari.queue import ArchiveQueue
 from arkivari.robots import RobotsPolicy
+from arkivari.spn_config import SpnConfig
 
 
 def _is_rate_limited_error(error: str | None) -> bool:
     if not error:
         return False
     lowered = error.lower()
+    if "error:too-many-daily-captures" in lowered:
+        return False
     return "429" in error or "rate limit" in lowered
 
 
@@ -37,6 +40,7 @@ def run_archive_session(
     until_complete: bool,
     verbose: bool,
     log: logging.Logger,
+    spn_config: SpnConfig,
     on_segment_complete: Callable[[ArchiveSummary, int], None] | None = None,
 ) -> SessionOutcome:
     """
@@ -46,7 +50,7 @@ def run_archive_session(
     When until_complete is True, waits for UTC quota reset and continues until pending is empty.
     """
     summary = ArchiveSummary()
-    rate_limiter = ArchiveRateLimiter()
+    rate_limiter = ArchiveRateLimiter(spn_config.min_interval_seconds)
     session = requests.Session()
     segment = 1
     session_budget: int | None = None if until_complete else queue.remaining_utc_quota()
@@ -92,6 +96,7 @@ def run_archive_session(
                     user_agent,
                     rate_limiter,
                     session=session,
+                    spn_config=spn_config,
                 )
                 if (
                     result.status == "failed"
