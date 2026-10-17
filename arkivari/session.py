@@ -12,6 +12,12 @@ from typing import Callable
 import requests
 
 from arkivari.archive import ArchiveResult, ArchiveSummary, archive_url
+from arkivari.capture_outcome import (
+    CaptureOutcomeKind,
+    is_deferred_outcome,
+    log_capture_outcome,
+    outcome_kind_for_result,
+)
 from arkivari.quota import wait_for_utc_quota_reset
 from arkivari.queue import ArchiveQueue
 from arkivari.rate_limiter import CrawlRateLimiter, TokenBucketRateLimiter
@@ -23,21 +29,6 @@ SAVE_BATCH_SIZE = 10
 RATE_LIMIT_COOLDOWN_SECONDS = 30.0
 # Minimum spacing between SPN /save/status polls across all worker threads.
 SPN_POLL_MIN_INTERVAL_SECONDS = 2.0
-
-
-def _is_poll_timeout_error(error: str | None) -> bool:
-    if not error:
-        return False
-    return "timed out waiting for internet archive job" in error.lower()
-
-
-def _is_rate_limited_error(error: str | None) -> bool:
-    if not error:
-        return False
-    lowered = error.lower()
-    if "error:too-many-daily-captures" in lowered:
-        return False
-    return "429" in error or "rate limit" in lowered
 
 
 @dataclass
@@ -104,9 +95,11 @@ def run_archive_session(
         last_save_at = time.monotonic()
         completions_since_save = 0
         log.info(
-            "Progress: %d archived, %d cached, %d failed, %d in-flight, %d pending",
+            "Progress: %d new, %d reused snapshot, %d deferred retry, "
+            "%d capture errors, %d in-flight, %d pending",
             summary.archived_count,
             summary.cached_count,
+            summary.deferred_count,
             summary.failed_count,
             len(in_flight),
             queue.pending_count,
@@ -156,11 +149,17 @@ def run_archive_session(
                     )
                     queue.apply_robots_skip(result)
                     summary.add(result)
-                    if verbose:
-                        log.info("Skipped (robots.txt): %s", url)
+                    log_capture_outcome(log, result, verbose=verbose)
                     continue
 
                 rate_limiter.acquire()
+                if verbose:
+                    log.info(
+                        "Submitting capture (%d/%d in-flight max): %s",
+                        len(in_flight) + 1,
+                        spn_config.max_concurrent,
+                        url,
+                    )
                 future = executor.submit(
                     _capture_worker, url, user_agent, spn_config, poll_limiter,
                 )
@@ -169,7 +168,7 @@ def run_archive_session(
             if not in_flight:
                 continue
 
-            # -- collect completions ------------------------------------------
+            # -- collect completions -----------------------------------------
             for future in as_completed(in_flight):
                 url = in_flight.pop(future)
                 try:
@@ -177,40 +176,30 @@ def run_archive_session(
                 except Exception as exc:
                     result = ArchiveResult(url=url, status="failed", error=str(exc)[:300])
 
-                summary.add(result)
+                kind = outcome_kind_for_result(result)
+                deferred = result.status == "failed" and is_deferred_outcome(kind)
+                summary.add(result, deferred=deferred)
 
                 if result.status in ("archived", "cached"):
                     queue.apply_archive_result(result)
                     if session_budget is not None:
                         session_budget -= 1
-                    if verbose:
-                        if result.status == "archived":
-                            log.info("Archived: %s -> %s", url, result.archive_url)
-                        else:
-                            log.info("Already cached: %s -> %s", url, result.archive_url)
+                    log_capture_outcome(log, result, verbose=verbose)
                 elif result.status == "failed":
-                    if _is_rate_limited_error(result.error):
+                    cooldown: float | None = None
+                    if kind == CaptureOutcomeKind.DEFERRED_SUBMIT_RATE_LIMIT:
                         rate_limiter.cooldown(RATE_LIMIT_COOLDOWN_SECONDS)
-                        log.warning(
-                            "Rate limited on %s; cooling down %.0fs before next submission",
-                            url,
-                            RATE_LIMIT_COOLDOWN_SECONDS,
-                        )
-                        queue.move_to_back(url)
-                    elif _is_poll_timeout_error(result.error):
-                        log.warning(
-                            "Poll timeout on %s; re-queuing (IA job may still complete)",
-                            url,
-                        )
-                        queue.move_to_back(url)
-                    else:
-                        queue.move_to_back(url)
-                    if verbose and not _is_poll_timeout_error(result.error):
-                        log.error("Failed: %s (%s)", url, result.error)
-                    elif verbose and _is_poll_timeout_error(result.error):
-                        log.info("Re-queued after timeout: %s", url)
+                        cooldown = RATE_LIMIT_COOLDOWN_SECONDS
+                    queue.move_to_back(url)
+                    log_capture_outcome(
+                        log,
+                        result,
+                        verbose=True,
+                        cooldown_seconds=cooldown,
+                    )
                 else:
                     queue.apply_archive_result(result)
+                    log_capture_outcome(log, result, verbose=verbose)
 
                 completions_since_save += 1
                 if _needs_save():
@@ -223,7 +212,12 @@ def run_archive_session(
             f.cancel()
         executor.shutdown(wait=False)
         queue.save(queue_path)
-        log.warning("Archive interrupted; progress saved to %s", queue_path)
+        log.warning(
+            "Archive interrupted (%d in-flight, %d pending); progress saved to %s",
+            len(in_flight),
+            queue.pending_count,
+            queue_path,
+        )
         return SessionOutcome(summary=summary, interrupted=True, segments=segment)
 
     executor.shutdown(wait=True)

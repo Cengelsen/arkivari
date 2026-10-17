@@ -70,10 +70,11 @@ class ArchiveSummary:
     archived_count: int = 0
     cached_count: int = 0
     skipped_robots: int = 0
+    deferred_count: int = 0
     failed_count: int = 0
     results: list[ArchiveResult] = field(default_factory=list)
 
-    def add(self, result: ArchiveResult) -> None:
+    def add(self, result: ArchiveResult, *, deferred: bool = False) -> None:
         self.results.append(result)
         if result.status == "archived":
             self.archived_count += 1
@@ -82,7 +83,10 @@ class ArchiveSummary:
         elif result.status == "skipped":
             self.skipped_robots += 1
         elif result.status == "failed":
-            self.failed_count += 1
+            if deferred:
+                self.deferred_count += 1
+            else:
+                self.failed_count += 1
 
 
 class SpnError(Exception):
@@ -359,10 +363,7 @@ def archive_url(
         except SpnError as exc:
             message = str(exc)
             if "429" in message or "rate limit" in message.lower():
-                logger.warning(
-                    "Rate limited archiving %s; returning to queue",
-                    url,
-                )
+                logger.debug("SPN submit HTTP 429 for %s", url)
                 return ArchiveResult(url=url, status="failed", error=message[:_MAX_ERROR_LENGTH])
             return ArchiveResult(url=url, status="failed", error=message[:_MAX_ERROR_LENGTH])
 

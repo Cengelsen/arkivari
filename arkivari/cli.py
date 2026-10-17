@@ -326,6 +326,7 @@ def _summary_to_report_dict(
         "archived_count": archive_summary.archived_count,
         "cached_count": archive_summary.cached_count,
         "skipped_robots": archive_summary.skipped_robots,
+        "deferred_count": archive_summary.deferred_count,
         "failed_count": archive_summary.failed_count,
         "results": [
             {
@@ -582,11 +583,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         write_report(args.output, base_url, queue, summary)
         log.info(
-            "Segment %d done: %d archived, %d cached, %d skipped (robots), %d failed",
+            "Segment %d done: %d new, %d reused snapshot, %d skipped (robots), "
+            "%d deferred, %d errors",
             segment,
             archive_summary.archived_count,
             archive_summary.cached_count,
             archive_summary.skipped_robots,
+            archive_summary.deferred_count,
             archive_summary.failed_count,
         )
         log.info(
@@ -639,10 +642,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         write_report(args.output, base_url, queue, summary)
         log.info(
-            "Batch done: %d archived, %d cached, %d skipped (robots), %d failed",
+            "Batch done: %d new, %d reused snapshot, %d skipped (robots), "
+            "%d deferred, %d errors",
             outcome.summary.archived_count,
             outcome.summary.cached_count,
             outcome.summary.skipped_robots,
+            outcome.summary.deferred_count,
             outcome.summary.failed_count,
         )
         log.info(
