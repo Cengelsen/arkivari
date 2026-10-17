@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 import requests
 
+from arkivari.rate_limiter import CrawlRateLimiter
 from arkivari.spn_config import (
     SPN_CAPTURE_OPTIONS,
     SpnConfig,
@@ -31,7 +32,9 @@ MIN_INTERVAL_SECONDS = 60.0 / ANONYMOUS_CAPTURES_PER_MINUTE
 ESTIMATED_CAPTURE_SECONDS = 15.0
 MAX_RETRIES = 5
 POLL_INTERVAL_SECONDS = 3.0
-MAX_POLL_SECONDS = 120.0
+# SPN2 max capture duration is ~2m; allow extra time for IA queue delays and poll 429s.
+MAX_POLL_SECONDS = 300.0
+POLL_429_BACKOFF_SECONDS = 15.0
 
 
 def estimate_archive_seconds(
@@ -202,12 +205,22 @@ def _submit_capture_authenticated(
     return str(job_id), message if isinstance(message, str) else None
 
 
+def _retry_after_seconds(response: requests.Response, default: float) -> float:
+    raw = response.headers.get("Retry-After")
+    if not raw:
+        return default
+    try:
+        return min(max(float(raw.strip()), 1.0), 120.0)
+    except ValueError:
+        return default
+
+
 def _poll_capture(
     session: requests.Session,
     job_id: str,
     user_agent: str,
     spn_config: SpnConfig,
-    min_interval_seconds: float,
+    poll_limiter: CrawlRateLimiter | None = None,
 ) -> dict[str, Any]:
     """Poll job status until success, error, or timeout."""
     deadline = time.monotonic() + MAX_POLL_SECONDS
@@ -216,6 +229,8 @@ def _poll_capture(
         poll_headers["Authorization"] = authorization_header(spn_config)
 
     while time.monotonic() < deadline:
+        if poll_limiter is not None:
+            poll_limiter.acquire()
         response = session.get(
             f"{SAVE_PAGE_URL}status/{job_id}",
             params={"_t": int(time.time() * 1000)},
@@ -224,7 +239,7 @@ def _poll_capture(
         )
 
         if response.status_code == 429:
-            time.sleep(min_interval_seconds)
+            time.sleep(_retry_after_seconds(response, POLL_429_BACKOFF_SECONDS))
             continue
 
         if response.status_code >= 400:
@@ -289,6 +304,7 @@ def _run_capture(
     url: str,
     user_agent: str,
     spn_config: SpnConfig,
+    poll_limiter: CrawlRateLimiter | None = None,
 ) -> ArchiveResult:
     """Archive a URL via POST submit and async status polling."""
     if spn_config.authenticated:
@@ -303,7 +319,7 @@ def _run_capture(
         job_id,
         user_agent,
         spn_config,
-        spn_config.min_interval_seconds,
+        poll_limiter,
     )
     return _payload_to_result(url, payload, submit_message)
 
@@ -313,6 +329,7 @@ def archive_url(
     user_agent: str,
     session: requests.Session | None = None,
     spn_config: SpnConfig | None = None,
+    poll_limiter: CrawlRateLimiter | None = None,
 ) -> ArchiveResult:
     """Archive a single URL via Save Page Now.
 
@@ -337,7 +354,7 @@ def archive_url(
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            return _run_capture(http, url, user_agent, config)
+            return _run_capture(http, url, user_agent, config, poll_limiter)
 
         except SpnError as exc:
             message = str(exc)

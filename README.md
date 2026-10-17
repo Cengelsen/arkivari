@@ -86,7 +86,7 @@ Create S3 keys at [archive.org/account/s3.php](https://archive.org/account/s3.ph
 | Anonymous | 3 | 4,000 | Default without keys |
 | Authenticated | 7 | 100,000 | Auto when keys are set |
 
-arkivari submits captures **concurrently** (up to 3 in-flight for authenticated, 2 for anonymous), rate-limited to 7 or 3 submissions per minute respectively. Concurrency is kept conservative because all captures target the same host — higher values trigger IA's per-host throttling. Internet Archive also limits **10 captures per URL per UTC day**.
+arkivari submits captures **concurrently** (see `AUTHENTICATED_MAX_CONCURRENT` / `ANONYMOUS_MAX_CONCURRENT` in `arkivari/spn_config.py`), rate-limited by `AUTHENTICATED_CAPTURES_PER_MINUTE` / `ANONYMOUS_CAPTURES_PER_MINUTE`. Status polls are spaced globally (~2s minimum across all workers) so concurrent jobs do not flood IA's Save Page Now API. Internet Archive also limits **10 captures per URL per UTC day**.
 
 Authenticated submits also use `skip_first_archive=1` and `if_not_archived_within=30m` so recent captures count as cached without a full re-capture when possible.
 

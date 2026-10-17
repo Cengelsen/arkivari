@@ -14,13 +14,21 @@ import requests
 from arkivari.archive import ArchiveResult, ArchiveSummary, archive_url
 from arkivari.quota import wait_for_utc_quota_reset
 from arkivari.queue import ArchiveQueue
-from arkivari.rate_limiter import TokenBucketRateLimiter
+from arkivari.rate_limiter import CrawlRateLimiter, TokenBucketRateLimiter
 from arkivari.robots import RobotsPolicy
 from arkivari.spn_config import SpnConfig
 
 SAVE_INTERVAL_SECONDS = 30.0
 SAVE_BATCH_SIZE = 10
 RATE_LIMIT_COOLDOWN_SECONDS = 30.0
+# Minimum spacing between SPN /save/status polls across all worker threads.
+SPN_POLL_MIN_INTERVAL_SECONDS = 2.0
+
+
+def _is_poll_timeout_error(error: str | None) -> bool:
+    if not error:
+        return False
+    return "timed out waiting for internet archive job" in error.lower()
 
 
 def _is_rate_limited_error(error: str | None) -> bool:
@@ -43,6 +51,7 @@ def _capture_worker(
     url: str,
     user_agent: str,
     spn_config: SpnConfig,
+    poll_limiter: CrawlRateLimiter,
 ) -> ArchiveResult:
     """Run a single capture in a worker thread (thread-local session)."""
     session = requests.Session()
@@ -51,6 +60,7 @@ def _capture_worker(
         user_agent,
         session=session,
         spn_config=spn_config,
+        poll_limiter=poll_limiter,
     )
 
 
@@ -75,6 +85,7 @@ def run_archive_session(
     """
     summary = ArchiveSummary()
     rate_limiter = TokenBucketRateLimiter(spn_config.captures_per_minute)
+    poll_limiter = CrawlRateLimiter(SPN_POLL_MIN_INTERVAL_SECONDS)
     segment = 1
     session_budget: int | None = None if until_complete else queue.remaining_utc_quota()
 
@@ -151,7 +162,7 @@ def run_archive_session(
 
                 rate_limiter.acquire()
                 future = executor.submit(
-                    _capture_worker, url, user_agent, spn_config,
+                    _capture_worker, url, user_agent, spn_config, poll_limiter,
                 )
                 in_flight[future] = url
 
@@ -186,10 +197,18 @@ def run_archive_session(
                             RATE_LIMIT_COOLDOWN_SECONDS,
                         )
                         queue.move_to_back(url)
+                    elif _is_poll_timeout_error(result.error):
+                        log.warning(
+                            "Poll timeout on %s; re-queuing (IA job may still complete)",
+                            url,
+                        )
+                        queue.move_to_back(url)
                     else:
                         queue.move_to_back(url)
-                    if verbose:
+                    if verbose and not _is_poll_timeout_error(result.error):
                         log.error("Failed: %s (%s)", url, result.error)
+                    elif verbose and _is_poll_timeout_error(result.error):
+                        log.info("Re-queued after timeout: %s", url)
                 else:
                     queue.apply_archive_result(result)
 

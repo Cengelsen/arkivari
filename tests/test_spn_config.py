@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from arkivari.spn_config import (
+    ANONYMOUS_CAPTURES_PER_MINUTE,
     ANONYMOUS_DAILY_CAP,
     ANONYMOUS_MAX_CONCURRENT,
     AUTHENTICATED_DAILY_CAP,
@@ -68,7 +69,7 @@ class TestResolveSpnConfig:
         config = resolve_spn_config()
         assert not config.authenticated
         assert config.daily_cap == ANONYMOUS_DAILY_CAP
-        assert config.captures_per_minute == 3
+        assert config.captures_per_minute == ANONYMOUS_CAPTURES_PER_MINUTE
         assert config.max_concurrent == ANONYMOUS_MAX_CONCURRENT
 
     def test_authenticated_with_keys(self, monkeypatch: pytest.MonkeyPatch) -> None:

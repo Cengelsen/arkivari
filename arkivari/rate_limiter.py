@@ -51,10 +51,10 @@ class TokenBucketRateLimiter:
 
 
 class CrawlRateLimiter:
-    """Thread-safe interval limiter for crawl-delay enforcement.
+    """Thread-safe minimum-interval limiter shared across threads.
 
-    Ensures that at most one request is issued per *delay* seconds,
-    regardless of how many threads are calling :meth:`acquire`.
+    Ensures at least *delay* seconds between consecutive :meth:`acquire`
+    calls (used for robots crawl-delay and SPN status polling).
     """
 
     def __init__(self, delay: float) -> None:
