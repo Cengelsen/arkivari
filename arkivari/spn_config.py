@@ -21,7 +21,7 @@ IF_NOT_ARCHIVED_WITHIN = "30m"
 # IA's "host overloaded" throttling.  Since arkivari archives one domain at a
 # time, keep these conservative.
 ANONYMOUS_MAX_CONCURRENT = 4
-AUTHENTICATED_MAX_CONCURRENT = 8
+AUTHENTICATED_MAX_CONCURRENT = 7
 
 # Toggle Save Page Now capture options (same names as the web.archive.org/save form).
 # Screenshot, my web archive, email, and WACZ require an Internet Archive account (S3 keys).
