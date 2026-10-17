@@ -20,7 +20,7 @@ IF_NOT_ARCHIVED_WITHIN = "30m"
 # globally, but having too many concurrent captures on the *same host* triggers
 # IA's "host overloaded" throttling.  Since arkivari archives one domain at a
 # time, keep these conservative.
-ANONYMOUS_MAX_CONCURRENT = 4
+ANONYMOUS_MAX_CONCURRENT = 6
 AUTHENTICATED_MAX_CONCURRENT = 7
 
 # Toggle Save Page Now capture options (same names as the web.archive.org/save form).
