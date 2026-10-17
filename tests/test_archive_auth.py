@@ -6,7 +6,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from arkivari.archive import ArchiveRateLimiter, archive_url
+from arkivari.archive import archive_url
+from arkivari.rate_limiter import TokenBucketRateLimiter
 from arkivari.spn_config import SpnConfig
 
 
@@ -21,10 +22,10 @@ def _auth_config() -> SpnConfig:
     )
 
 
-class TestArchiveRateLimiter:
+class TestTokenBucketInterval:
     def test_authenticated_interval(self) -> None:
-        limiter = ArchiveRateLimiter(60.0 / 7)
-        assert limiter._min_interval_seconds == pytest.approx(8.571, rel=0.01)
+        limiter = TokenBucketRateLimiter(7)
+        assert limiter._min_interval == pytest.approx(8.571, rel=0.01)
 
 
 class TestAuthenticatedArchiveUrl:
@@ -42,11 +43,9 @@ class TestAuthenticatedArchiveUrl:
             "original_url": "https://example.com/",
         }
         config = _auth_config()
-        limiter = ArchiveRateLimiter(config.min_interval_seconds)
         result = archive_url(
             "https://example.com/",
             "test-agent",
-            limiter,
             spn_config=config,
         )
         assert result.status == "archived"
@@ -67,11 +66,9 @@ class TestAuthenticatedArchiveUrl:
             "message": "Target URL could not be accessed",
         }
         config = _auth_config()
-        limiter = ArchiveRateLimiter(config.min_interval_seconds)
         result = archive_url(
             "https://example.com/private",
             "test-agent",
-            limiter,
             spn_config=config,
         )
         assert result.status == "failed"

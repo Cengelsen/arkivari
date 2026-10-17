@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ACCESS_KEY_ENV = "SAVEPAGENOW_ACCESS_KEY"
-ANONYMOUS_CAPTURES_PER_MINUTE = 3
+ANONYMOUS_CAPTURES_PER_MINUTE = 6
 ANONYMOUS_DAILY_CAP = 4000
 SECRET_KEY_ENV = "SAVEPAGENOW_SECRET_KEY"
 
@@ -16,11 +16,18 @@ AUTHENTICATED_CAPTURES_PER_MINUTE = 7
 AUTHENTICATED_DAILY_CAP = 100_000
 IF_NOT_ARCHIVED_WITHIN = "30m"
 
+# Per-host concurrency limits.  IA allows 12 concurrent pending jobs per user
+# globally, but having too many concurrent captures on the *same host* triggers
+# IA's "host overloaded" throttling.  Since arkivari archives one domain at a
+# time, keep these conservative.
+ANONYMOUS_MAX_CONCURRENT = 4
+AUTHENTICATED_MAX_CONCURRENT = 8
+
 # Toggle Save Page Now capture options (same names as the web.archive.org/save form).
 # Screenshot, my web archive, email, and WACZ require an Internet Archive account (S3 keys).
 SPN_CAPTURE_OPTIONS: dict[str, bool] = {
     "capture_all": True,  # Save error pages (HTTP 4xx, 5xx)
-    "capture_outlinks": True,  # Save outlinks (up to 100 per page)
+    "capture_outlinks": False,  # Save outlinks (up to 100 per page) — WARNING: causes IA to spawn up to 100 extra captures per URL on the same host, easily triggering per-host throttling
     "capture_screenshot": False,
     "disable_adblocker": False,
     "wm-save-mywebarchive": False,  # Save also in my web archive
@@ -47,6 +54,7 @@ class SpnConfig:
     daily_cap: int
     min_interval_seconds: float
     if_not_archived_within: str = IF_NOT_ARCHIVED_WITHIN
+    max_concurrent: int = ANONYMOUS_MAX_CONCURRENT
     capture_options: dict[str, bool] = field(default_factory=_default_capture_options)
 
     @property
@@ -106,6 +114,7 @@ def resolve_spn_config(force_anonymous: bool = False) -> SpnConfig:
             captures_per_minute=AUTHENTICATED_CAPTURES_PER_MINUTE,
             daily_cap=AUTHENTICATED_DAILY_CAP,
             min_interval_seconds=interval,
+            max_concurrent=AUTHENTICATED_MAX_CONCURRENT,
             capture_options=dict(SPN_CAPTURE_OPTIONS),
         )
     return _anonymous_config()

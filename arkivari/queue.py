@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import re
+import threading
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,7 +32,7 @@ class CompletedEntry:
 @dataclass
 class ArchiveQueue:
     domain: str
-    pending: list[str] = field(default_factory=list)
+    pending: deque[str] = field(default_factory=deque)
     completed: list[CompletedEntry] = field(default_factory=list)
     daily_limit: int = ANONYMOUS_DAILY_CAP
     created_at: str = ""
@@ -43,6 +46,9 @@ class ArchiveQueue:
             self.created_at = now
         if not self.updated_at:
             self.updated_at = now
+        if not isinstance(self.pending, deque):
+            self.pending = deque(self.pending)
+        self._lock = threading.Lock()
 
     @property
     def completed_urls(self) -> set[str]:
@@ -87,7 +93,14 @@ class ArchiveQueue:
         return not self.pending
 
     def peek_batch(self, size: int) -> list[str]:
-        return self.pending[:size]
+        return list(itertools.islice(self.pending, size))
+
+    def pop_next(self) -> str | None:
+        """Atomically pop the next pending URL (thread-safe)."""
+        with self._lock:
+            if not self.pending:
+                return None
+            return self.pending.popleft()
 
     def _bump_quota_for_today(self) -> None:
         today = utc_today_iso()
@@ -95,56 +108,67 @@ class ArchiveQueue:
 
     def apply_robots_skip(self, result: ArchiveResult) -> None:
         """Remove a robots-disallowed URL from pending without using daily quota."""
-        if not self.pending or self.pending[0] != result.url:
-            return
-        now = datetime.now(timezone.utc).isoformat()
-        self.pending.pop(0)
-        self.completed.append(
-            CompletedEntry(
-                url=result.url,
-                status=result.status,
-                archive_url=result.archive_url,
-                error=result.error,
-                archived_at=now,
+        with self._lock:
+            if self.pending and self.pending[0] == result.url:
+                self.pending.popleft()
+            now = datetime.now(timezone.utc).isoformat()
+            self.completed.append(
+                CompletedEntry(
+                    url=result.url,
+                    status=result.status,
+                    archive_url=result.archive_url,
+                    error=result.error,
+                    archived_at=now,
+                )
             )
-        )
-        self.updated_at = now
+            self.updated_at = now
 
     def apply_archive_result(self, result: ArchiveResult) -> None:
-        """Apply a single archive result for the head of the pending queue."""
-        if not self.pending or self.pending[0] != result.url:
-            return
+        """Record a completed archive result (thread-safe)."""
+        with self._lock:
+            if result.status == "failed":
+                return
 
-        if result.status == "failed":
-            return
-
-        now = datetime.now(timezone.utc).isoformat()
-        self.pending.pop(0)
-        self.completed.append(
-            CompletedEntry(
-                url=result.url,
-                status=result.status,
-                archive_url=result.archive_url,
-                error=result.error,
-                archived_at=now,
+            now = datetime.now(timezone.utc).isoformat()
+            try:
+                self.pending.remove(result.url)
+            except ValueError:
+                pass
+            self.completed.append(
+                CompletedEntry(
+                    url=result.url,
+                    status=result.status,
+                    archive_url=result.archive_url,
+                    error=result.error,
+                    archived_at=now,
+                )
             )
-        )
-        if result.status in ("archived", "cached"):
-            self._bump_quota_for_today()
-        self.updated_at = now
+            if result.status in ("archived", "cached"):
+                self._bump_quota_for_today()
+            self.updated_at = now
+
+    def move_to_back(self, url: str) -> None:
+        """Move a failed URL to the end of the pending queue (thread-safe)."""
+        with self._lock:
+            try:
+                self.pending.remove(url)
+            except ValueError:
+                return
+            self.pending.append(url)
 
     def save(self, path: Path) -> None:
-        payload = {
-            "version": QUEUE_VERSION,
-            "domain": self.domain,
-            "created_at": self.created_at,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "daily_limit": self.daily_limit,
-            "archives_by_date": self.archives_by_date,
-            "pending": self.pending,
-            "completed": [asdict(entry) for entry in self.completed],
-            "discovery": self.discovery,
-        }
+        with self._lock:
+            payload = {
+                "version": QUEUE_VERSION,
+                "domain": self.domain,
+                "created_at": self.created_at,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "daily_limit": self.daily_limit,
+                "archives_by_date": self.archives_by_date,
+                "pending": list(self.pending),
+                "completed": [asdict(entry) for entry in self.completed],
+                "discovery": self.discovery,
+            }
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     @classmethod
@@ -160,7 +184,7 @@ class ArchiveQueue:
 
         return cls(
             domain=data["domain"],
-            pending=list(data.get("pending", [])),
+            pending=deque(data.get("pending", [])),
             completed=completed,
             daily_limit=data.get("daily_limit", ANONYMOUS_DAILY_CAP),
             created_at=data.get("created_at", ""),
@@ -195,7 +219,7 @@ class ArchiveQueue:
 
         queue = cls(
             domain=domain,
-            pending=pending,
+            pending=deque(pending),
             completed=completed,
             daily_limit=daily_limit,
             created_at=existing.created_at if existing else "",

@@ -1,19 +1,26 @@
-"""Quota-aware archive session driver."""
+"""Quota-aware concurrent archive session driver."""
 
 from __future__ import annotations
 
 import logging
+import time
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 import requests
 
-from arkivari.archive import ArchiveRateLimiter, ArchiveResult, ArchiveSummary, archive_url
+from arkivari.archive import ArchiveResult, ArchiveSummary, archive_url
 from arkivari.quota import wait_for_utc_quota_reset
 from arkivari.queue import ArchiveQueue
+from arkivari.rate_limiter import TokenBucketRateLimiter
 from arkivari.robots import RobotsPolicy
 from arkivari.spn_config import SpnConfig
+
+SAVE_INTERVAL_SECONDS = 30.0
+SAVE_BATCH_SIZE = 10
+RATE_LIMIT_COOLDOWN_SECONDS = 30.0
 
 
 def _is_rate_limited_error(error: str | None) -> bool:
@@ -32,6 +39,21 @@ class SessionOutcome:
     segments: int = 1
 
 
+def _capture_worker(
+    url: str,
+    user_agent: str,
+    spn_config: SpnConfig,
+) -> ArchiveResult:
+    """Run a single capture in a worker thread (thread-local session)."""
+    session = requests.Session()
+    return archive_url(
+        url,
+        user_agent,
+        session=session,
+        spn_config=spn_config,
+    )
+
+
 def run_archive_session(
     queue: ArchiveQueue,
     queue_path: Path,
@@ -44,16 +66,40 @@ def run_archive_session(
     on_segment_complete: Callable[[ArchiveSummary, int], None] | None = None,
 ) -> SessionOutcome:
     """
-    Archive pending URLs respecting UTC daily quota and per-minute rate limits.
+    Archive pending URLs concurrently, respecting UTC daily quota and rate limits.
 
-    When until_complete is False, stops after using the remaining UTC quota for today.
-    When until_complete is True, waits for UTC quota reset and continues until pending is empty.
+    Submits up to ``spn_config.max_concurrent`` capture jobs in parallel.
+    Each submission is rate-limited by a shared :class:`TokenBucketRateLimiter`.
+    The queue is saved periodically (every ~30 s or ~10 completions) instead of
+    after every single URL, plus on interrupt and at session end.
     """
     summary = ArchiveSummary()
-    rate_limiter = ArchiveRateLimiter(spn_config.min_interval_seconds)
-    session = requests.Session()
+    rate_limiter = TokenBucketRateLimiter(spn_config.captures_per_minute)
     segment = 1
     session_budget: int | None = None if until_complete else queue.remaining_utc_quota()
+
+    last_save_at = time.monotonic()
+    completions_since_save = 0
+
+    def _needs_save() -> bool:
+        return (
+            completions_since_save >= SAVE_BATCH_SIZE
+            or (time.monotonic() - last_save_at) >= SAVE_INTERVAL_SECONDS
+        )
+
+    def _do_save() -> None:
+        nonlocal last_save_at, completions_since_save
+        queue.save(queue_path)
+        last_save_at = time.monotonic()
+        completions_since_save = 0
+        log.info(
+            "Progress: %d archived, %d cached, %d failed, %d in-flight, %d pending",
+            summary.archived_count,
+            summary.cached_count,
+            summary.failed_count,
+            len(in_flight),
+            queue.pending_count,
+        )
 
     def finish_segment() -> None:
         nonlocal summary, segment
@@ -62,9 +108,13 @@ def run_archive_session(
         summary = ArchiveSummary()
         segment += 1
 
+    executor = ThreadPoolExecutor(max_workers=spn_config.max_concurrent)
+    in_flight: dict[Future[ArchiveResult], str] = {}
+
     try:
-        while queue.pending:
-            if queue.remaining_utc_quota() == 0:
+        while queue.pending or in_flight:
+            # -- quota gate --------------------------------------------------
+            if queue.remaining_utc_quota() == 0 and not in_flight:
                 if not until_complete:
                     break
                 if on_segment_complete and summary.results:
@@ -73,70 +123,92 @@ def run_archive_session(
                     return SessionOutcome(summary=summary, interrupted=True, segments=segment)
                 continue
 
-            if session_budget is not None and session_budget <= 0:
+            if session_budget is not None and session_budget <= 0 and not in_flight:
                 break
 
-            url = queue.pending[0]
-            if not robots.can_fetch(url):
-                result = ArchiveResult(
-                    url=url,
-                    status="skipped",
-                    error="Disallowed by robots.txt",
-                )
-                queue.apply_robots_skip(result)
-                summary.add(result)
-                queue.save(queue_path)
-                if verbose:
-                    log.info("Skipped (robots.txt): %s", url)
-                continue
+            # -- fill slots ---------------------------------------------------
+            while (
+                len(in_flight) < spn_config.max_concurrent
+                and queue.pending
+                and (session_budget is None or session_budget > 0)
+                and queue.remaining_utc_quota() > len(in_flight)
+            ):
+                url = queue.pop_next()
+                if url is None:
+                    break
 
-            while True:
-                result = archive_url(
-                    url,
-                    user_agent,
-                    rate_limiter,
-                    session=session,
-                    spn_config=spn_config,
-                )
-                if (
-                    result.status == "failed"
-                    and _is_rate_limited_error(result.error)
-                    and until_complete
-                ):
-                    log.warning("Rate limited by Internet Archive; waiting for UTC quota reset")
-                    if on_segment_complete and summary.results:
-                        finish_segment()
-                    if not wait_for_utc_quota_reset(log):
-                        return SessionOutcome(summary=summary, interrupted=True, segments=segment)
+                if not robots.can_fetch(url):
+                    result = ArchiveResult(
+                        url=url,
+                        status="skipped",
+                        error="Disallowed by robots.txt",
+                    )
+                    queue.apply_robots_skip(result)
+                    summary.add(result)
+                    if verbose:
+                        log.info("Skipped (robots.txt): %s", url)
                     continue
 
-                break
+                rate_limiter.acquire()
+                future = executor.submit(
+                    _capture_worker, url, user_agent, spn_config,
+                )
+                in_flight[future] = url
 
-            summary.add(result)
-            if result.status in ("archived", "cached"):
-                queue.apply_archive_result(result)
-                if session_budget is not None:
-                    session_budget -= 1
-                queue.save(queue_path)
-                if verbose:
-                    if result.status == "archived":
-                        log.info("Archived: %s -> %s", url, result.archive_url)
+            if not in_flight:
+                continue
+
+            # -- collect completions ------------------------------------------
+            for future in as_completed(in_flight):
+                url = in_flight.pop(future)
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = ArchiveResult(url=url, status="failed", error=str(exc)[:300])
+
+                summary.add(result)
+
+                if result.status in ("archived", "cached"):
+                    queue.apply_archive_result(result)
+                    if session_budget is not None:
+                        session_budget -= 1
+                    if verbose:
+                        if result.status == "archived":
+                            log.info("Archived: %s -> %s", url, result.archive_url)
+                        else:
+                            log.info("Already cached: %s -> %s", url, result.archive_url)
+                elif result.status == "failed":
+                    if _is_rate_limited_error(result.error):
+                        rate_limiter.cooldown(RATE_LIMIT_COOLDOWN_SECONDS)
+                        log.warning(
+                            "Rate limited on %s; cooling down %.0fs before next submission",
+                            url,
+                            RATE_LIMIT_COOLDOWN_SECONDS,
+                        )
+                        queue.move_to_back(url)
                     else:
-                        log.info("Already cached: %s -> %s", url, result.archive_url)
-            elif result.status == "failed":
-                queue.pending.pop(0)
-                queue.pending.append(url)
-                queue.save(queue_path)
-                if verbose:
-                    log.error("Failed: %s (%s)", url, result.error)
-            else:
-                queue.apply_archive_result(result)
-                queue.save(queue_path)
+                        queue.move_to_back(url)
+                    if verbose:
+                        log.error("Failed: %s (%s)", url, result.error)
+                else:
+                    queue.apply_archive_result(result)
+
+                completions_since_save += 1
+                if _needs_save():
+                    _do_save()
+
+                break  # process one, then refill slots
 
     except KeyboardInterrupt:
+        for f in in_flight:
+            f.cancel()
+        executor.shutdown(wait=False)
         queue.save(queue_path)
         log.warning("Archive interrupted; progress saved to %s", queue_path)
         return SessionOutcome(summary=summary, interrupted=True, segments=segment)
+
+    executor.shutdown(wait=True)
+    queue.save(queue_path)
 
     if on_segment_complete and summary.results:
         on_segment_complete(summary, segment)

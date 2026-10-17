@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import secrets
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Literal
 from urllib.parse import urlparse
@@ -35,6 +36,7 @@ TRANSIENT_STATUS_CODES = (429, 502, 503)
 MAX_RETRIES = 3
 VALIDATION_TIMEOUT_SECONDS = 20
 HEAD_INCONCLUSIVE_CODES = (405, 501)
+VALIDATION_WORKERS = 5
 
 
 @dataclass
@@ -259,6 +261,18 @@ def check_link(
     )
 
 
+def _validate_one(
+    url: str,
+    session: requests.Session,
+    user_agent: str,
+    error_page_url: str | None,
+    robots: RobotsPolicy,
+) -> LinkCheckResult:
+    """Check a single URL inside a worker thread."""
+    robots.wait_for_crawl()
+    return check_link(url, session, user_agent, error_page_url)
+
+
 def validate_urls(
     urls: list[str],
     session: requests.Session,
@@ -267,7 +281,7 @@ def validate_urls(
     robots: RobotsPolicy,
     verbose: bool = False,
 ) -> ValidationResult:
-    """Check all discovered URLs and return only those with valid responses."""
+    """Check all discovered URLs concurrently and return only those with valid responses."""
     stats = ValidationStats()
     results: list[LinkCheckResult] = []
     accepted: list[str] = []
@@ -275,10 +289,23 @@ def validate_urls(
     error_page_url = probe_error_page(base_url, session, user_agent)
 
     total = len(urls)
-    for i, url in enumerate(urls, 1):
-        robots.wait_for_crawl()
 
-        result = check_link(url, session, user_agent, error_page_url)
+    executor = ThreadPoolExecutor(max_workers=VALIDATION_WORKERS)
+    future_to_url: dict = {}
+
+    for url in urls:
+        future = executor.submit(_validate_one, url, session, user_agent, error_page_url, robots)
+        future_to_url[future] = url
+
+    completed_count = 0
+    for future in as_completed(future_to_url):
+        url = future_to_url[future]
+        completed_count += 1
+        try:
+            result = future.result()
+        except Exception as exc:
+            result = LinkCheckResult(url=url, status="network_error", error=str(exc))
+
         stats.record(result.status)
         results.append(result)
 
@@ -294,8 +321,10 @@ def validate_urls(
                 extra += f" ({result.error})"
             logger.info(
                 "[%d/%d] %s %s %s%s",
-                i, total, code_str, result.status, url, extra,
+                completed_count, total, code_str, result.status, url, extra,
             )
+
+    executor.shutdown(wait=True)
 
     logger.info(
         "Validation complete: %d checked, %d included, %d excluded",

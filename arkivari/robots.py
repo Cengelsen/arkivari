@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
-import time
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
 import requests
+
+from arkivari.rate_limiter import CrawlRateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +24,7 @@ class RobotsPolicy:
         self.session = session or requests.Session()
         self._parser = RobotFileParser()
         self._loaded = False
-        self._last_request_at = 0.0
-        self._crawl_delay = DEFAULT_CRAWL_DELAY
+        self._crawl_limiter = CrawlRateLimiter(DEFAULT_CRAWL_DELAY)
 
     def load(self) -> None:
         """Fetch robots.txt from the target domain."""
@@ -48,7 +48,7 @@ class RobotsPolicy:
             if response.status_code == 200:
                 self._parser.parse(response.text.splitlines())
                 self._loaded = True
-                self._crawl_delay = self._resolve_crawl_delay()
+                self._crawl_limiter = CrawlRateLimiter(self._resolve_crawl_delay())
                 logger.info("Loaded robots.txt from %s", robots_url)
                 return
 
@@ -63,7 +63,7 @@ class RobotsPolicy:
     def _apply_permissive_policy(self) -> None:
         self._parser.parse(["User-agent: *", "Allow: /"])
         self._loaded = True
-        self._crawl_delay = DEFAULT_CRAWL_DELAY
+        self._crawl_limiter = CrawlRateLimiter(DEFAULT_CRAWL_DELAY)
 
     def _resolve_crawl_delay(self) -> float:
         delay = self._parser.crawl_delay(self.user_agent)
@@ -87,14 +87,8 @@ class RobotsPolicy:
         return list(sitemaps)
 
     def wait_for_crawl(self) -> None:
-        """Enforce crawl-delay between requests to the target site."""
-        if self._crawl_delay <= 0:
-            return
-        elapsed = time.monotonic() - self._last_request_at
-        remaining = self._crawl_delay - elapsed
-        if remaining > 0:
-            time.sleep(remaining)
-        self._last_request_at = time.monotonic()
+        """Enforce crawl-delay between requests to the target site (thread-safe)."""
+        self._crawl_limiter.acquire()
 
     def default_sitemap_urls(self) -> list[str]:
         """Return sitemap URLs from robots.txt plus the conventional /sitemap.xml."""

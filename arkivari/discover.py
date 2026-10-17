@@ -1,9 +1,11 @@
-"""URL discovery via sitemaps and bounded BFS crawling."""
+"""URL discovery via sitemaps and bounded concurrent BFS crawling."""
 
 from __future__ import annotations
 
 import logging
+import threading
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlparse, urlunparse
 
@@ -18,6 +20,7 @@ SKIP_SCHEMES = {"", "mailto", "javascript", "tel", "ftp", "data"}
 HTML_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
 INDEX_PATHS = {"/index.html", "/index.htm", "/index.php"}
 SITEMAP_TIMEOUT_SECONDS = 60
+CRAWL_WORKERS = 5
 
 
 @dataclass
@@ -218,6 +221,38 @@ def _unlimited(max_pages: int) -> bool:
     return max_pages <= 0
 
 
+def _fetch_page(
+    url: str,
+    user_agent: str,
+    robots: RobotsPolicy,
+) -> tuple[str, list[str]]:
+    """Fetch a single page and extract its outlinks. Runs in a worker thread."""
+    robots.wait_for_crawl()
+    session = requests.Session()
+    try:
+        response = session.get(url, headers={"User-Agent": user_agent}, timeout=15)
+    except requests.RequestException as exc:
+        logger.warning("Failed to crawl %s: %s", url, exc)
+        return url, []
+
+    if response.status_code != 200 or not is_html_response(response):
+        return url, []
+
+    soup = BeautifulSoup(response.text, "lxml")
+    links: list[str] = []
+    for link in soup.find_all("a", href=True):
+        href = link["href"].strip()
+        if not href or href.startswith("#"):
+            continue
+        parsed_href = urlparse(href)
+        if parsed_href.scheme in SKIP_SCHEMES and parsed_href.scheme != "":
+            continue
+        full_url = normalize_url(urljoin(url, href))
+        if full_url:
+            links.append(full_url)
+    return url, links
+
+
 def crawl_site(
     seed_url: str,
     target_netloc: str,
@@ -228,67 +263,80 @@ def crawl_site(
     exclude: set[str] | None = None,
     verbose: bool = False,
 ) -> tuple[set[str], bool]:
-    """Bounded BFS crawl of HTML pages on the target domain.
+    """Concurrent BFS crawl of HTML pages on the target domain.
 
     Returns discovered URLs (not in exclude) and whether the crawl hit its page budget
     while URLs remained in the queue. max_pages <= 0 means no limit.
     """
     exclude = exclude or set()
     discovered: set[str] = set()
-    queue: deque[str] = deque([seed_url])
+    bfs_queue: deque[str] = deque([seed_url])
     seen: set[str] = set()
+    seen_lock = threading.Lock()
 
-    while queue and (_unlimited(max_pages) or len(discovered) < max_pages):
-        current = queue.popleft()
-        normalized = normalize_url(current)
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
+    executor = ThreadPoolExecutor(max_workers=CRAWL_WORKERS)
+    in_flight: dict[Future[tuple[str, list[str]]], str] = {}
 
-        if not same_domain(normalized, target_netloc):
-            continue
-        if not robots.can_fetch(normalized):
-            if verbose:
-                logger.info("Skipping disallowed URL: %s", normalized)
-            continue
+    try:
+        while bfs_queue or in_flight:
+            if not _unlimited(max_pages) and len(discovered) >= max_pages:
+                break
 
-        robots.wait_for_crawl()
-        try:
-            response = session.get(normalized, headers={"User-Agent": user_agent}, timeout=15)
-        except requests.RequestException as exc:
-            logger.warning("Failed to crawl %s: %s", normalized, exc)
-            continue
+            # Fill worker slots from BFS queue
+            while bfs_queue and len(in_flight) < CRAWL_WORKERS:
+                if not _unlimited(max_pages) and len(discovered) + len(in_flight) >= max_pages:
+                    break
+                current = bfs_queue.popleft()
+                normalized = normalize_url(current)
+                if not normalized:
+                    continue
+                with seen_lock:
+                    if normalized in seen:
+                        continue
+                    seen.add(normalized)
 
-        if response.status_code != 200:
-            continue
+                if not same_domain(normalized, target_netloc):
+                    continue
+                if not robots.can_fetch(normalized):
+                    if verbose:
+                        logger.info("Skipping disallowed URL: %s", normalized)
+                    continue
 
-        if not is_html_response(response):
-            continue
+                future = executor.submit(_fetch_page, normalized, user_agent, robots)
+                in_flight[future] = normalized
 
-        if normalized not in exclude:
-            discovered.add(normalized)
-            if verbose:
-                logger.info("Crawled: %s", normalized)
+            if not in_flight:
+                break
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        for link in soup.find_all("a", href=True):
-            href = link["href"].strip()
-            if not href or href.startswith("#"):
-                continue
+            # Wait for one completion, then process
+            for future in as_completed(in_flight):
+                fetched_url = in_flight.pop(future)
+                try:
+                    _, links = future.result()
+                except Exception as exc:
+                    logger.warning("Crawl worker error for %s: %s", fetched_url, exc)
+                    break
 
-            parsed_href = urlparse(href)
-            if parsed_href.scheme in SKIP_SCHEMES and parsed_href.scheme != "":
-                continue
+                if fetched_url not in exclude:
+                    discovered.add(fetched_url)
+                    if verbose:
+                        logger.info("Crawled: %s", fetched_url)
 
-            full_url = normalize_url(urljoin(normalized, href))
-            if not full_url:
-                continue
-            if not same_domain(full_url, target_netloc):
-                continue
-            if full_url not in seen:
-                queue.append(full_url)
+                for link_url in links:
+                    if not same_domain(link_url, target_netloc):
+                        continue
+                    with seen_lock:
+                        if link_url not in seen:
+                            bfs_queue.append(link_url)
 
-    crawl_capped = bool(queue) and not _unlimited(max_pages) and len(discovered) >= max_pages
+                break  # process one, then refill slots
+
+    except KeyboardInterrupt:
+        logger.warning("Crawl interrupted")
+    finally:
+        executor.shutdown(wait=False)
+
+    crawl_capped = (bool(bfs_queue) or bool(in_flight)) and not _unlimited(max_pages) and len(discovered) >= max_pages
     return discovered, crawl_capped
 
 

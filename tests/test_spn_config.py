@@ -9,7 +9,9 @@ import pytest
 
 from arkivari.spn_config import (
     ANONYMOUS_DAILY_CAP,
+    ANONYMOUS_MAX_CONCURRENT,
     AUTHENTICATED_DAILY_CAP,
+    AUTHENTICATED_MAX_CONCURRENT,
     ACCESS_KEY_ENV,
     SECRET_KEY_ENV,
     SPN_CAPTURE_OPTIONS,
@@ -28,8 +30,8 @@ class TestSpnCaptureOptions:
         monkeypatch.delenv(SECRET_KEY_ENV, raising=False)
         config = resolve_spn_config()
         assert config.capture_options == SPN_CAPTURE_OPTIONS
-        config.capture_options["capture_outlinks"] = True
-        assert SPN_CAPTURE_OPTIONS["capture_outlinks"] is False
+        config.capture_options["capture_screenshot"] = True
+        assert SPN_CAPTURE_OPTIONS["capture_screenshot"] is False
 
     def test_post_fields_only_enabled(self) -> None:
         fields = spn_capture_post_fields({"capture_all": True, "wacz": False})
@@ -67,6 +69,7 @@ class TestResolveSpnConfig:
         assert not config.authenticated
         assert config.daily_cap == ANONYMOUS_DAILY_CAP
         assert config.captures_per_minute == 3
+        assert config.max_concurrent == ANONYMOUS_MAX_CONCURRENT
 
     def test_authenticated_with_keys(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(ACCESS_KEY_ENV, "test-access")
@@ -75,12 +78,14 @@ class TestResolveSpnConfig:
         assert config.authenticated
         assert config.daily_cap == AUTHENTICATED_DAILY_CAP
         assert config.captures_per_minute == 7
+        assert config.max_concurrent == AUTHENTICATED_MAX_CONCURRENT
 
     def test_force_anonymous(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(ACCESS_KEY_ENV, "test-access")
         monkeypatch.setenv(SECRET_KEY_ENV, "test-secret")
         config = resolve_spn_config(force_anonymous=True)
         assert not config.authenticated
+        assert config.max_concurrent == ANONYMOUS_MAX_CONCURRENT
 
 
 class TestResolveDailyLimit:

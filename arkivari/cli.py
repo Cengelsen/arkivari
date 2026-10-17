@@ -261,7 +261,8 @@ def print_queue_overview(
     if spn_config:
         print(
             f"  SPN mode:        {spn_config.mode_label} "
-            f"({spn_config.daily_cap:,}/day, {spn_config.captures_per_minute}/min)"
+            f"({spn_config.daily_cap:,}/day, {spn_config.captures_per_minute}/min, "
+            f"{spn_config.max_concurrent} concurrent)"
         )
     if stats:
         print(f"  Discovered:      {queue.total_count + stats.duplicates_skipped:,}", end="")
@@ -342,15 +343,17 @@ def _summary_to_report_dict(
         "quota_utc_date": utc_today_iso(),
         "archived_today_utc": queue.archived_today_utc,
         "spn_mode": spn_config.mode_label,
+        "max_concurrent": spn_config.max_concurrent,
     }
 
 
 def _log_spn_mode(log: logging.Logger, spn_config: SpnConfig) -> None:
     log.info(
-        "Save Page Now: %s (%s/day, %s/min)",
+        "Save Page Now: %s (%s/day, %s/min, %d concurrent)",
         spn_config.mode_label,
         f"{spn_config.daily_cap:,}",
         spn_config.captures_per_minute,
+        spn_config.max_concurrent,
     )
 
 
@@ -401,7 +404,8 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
-        format="%(levelname)s: %(message)s",
+        format="%(asctime)s %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
     )
     log = logging.getLogger("arkivari")
     _log_spn_mode(log, spn_config)

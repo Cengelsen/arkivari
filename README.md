@@ -55,7 +55,7 @@ For a site with 80,000 archivable pages:
 
 The queue file tracks completed URLs, pending URLs, and per-date quota usage (`archives_by_date`) so you cannot accidentally exceed the daily limit by re-running the same UTC day.
 
-Use `--until-complete` to let a single process run until the queue is empty: it archives while UTC quota remains, waits until **00:00 UTC** (plus 60 seconds) when the daily cap is reached, then continues. Long runs can span multiple UTC days without manual restarts. Press Ctrl+C to stop safely — progress is saved after each capture.
+Use `--until-complete` to let a single process run until the queue is empty: it archives while UTC quota remains, waits until **00:00 UTC** (plus 60 seconds) when the daily cap is reached, then continues. Long runs can span multiple UTC days without manual restarts. Press Ctrl+C to stop safely — progress is saved periodically and on interrupt. In-flight captures that haven't completed at interrupt time may need to be re-archived on the next run.
 
 ### Options
 
@@ -86,7 +86,7 @@ Create S3 keys at [archive.org/account/s3.php](https://archive.org/account/s3.ph
 | Anonymous | 3 | 4,000 | Default without keys |
 | Authenticated | 7 | 100,000 | Auto when keys are set |
 
-arkivari runs captures **sequentially** (one at a time). Internet Archive also limits concurrent pending jobs (12 authenticated) and **10 captures per URL per UTC day**.
+arkivari submits captures **concurrently** (up to 3 in-flight for authenticated, 2 for anonymous), rate-limited to 7 or 3 submissions per minute respectively. Concurrency is kept conservative because all captures target the same host — higher values trigger IA's per-host throttling. Internet Archive also limits **10 captures per URL per UTC day**.
 
 Authenticated submits also use `skip_first_archive=1` and `if_not_archived_within=30m` so recent captures count as cached without a full re-capture when possible.
 

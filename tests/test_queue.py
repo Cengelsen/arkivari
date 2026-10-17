@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import deque
 from pathlib import Path
 
 import pytest
@@ -43,7 +44,7 @@ class TestUtcQuota:
                 archive_url="https://web.archive.org/web/1/https://example.com/page",
             )
         )
-        assert queue.pending == []
+        assert list(queue.pending) == []
         assert queue.completed_count == 1
         assert queue.archives_by_date == {"2026-10-15": 1}
 
@@ -71,7 +72,7 @@ class TestUtcQuota:
         queue.apply_archive_result(
             ArchiveResult(url="https://example.com/page", status="failed", error="nope")
         )
-        assert queue.pending == ["https://example.com/page"]
+        assert list(queue.pending) == ["https://example.com/page"]
         assert queue.archives_by_date == {}
 
     def test_robots_skip_no_quota(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -87,7 +88,7 @@ class TestUtcQuota:
                 error="Disallowed by robots.txt",
             )
         )
-        assert queue.pending == []
+        assert list(queue.pending) == []
         assert queue.archives_by_date == {}
 
 

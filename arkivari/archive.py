@@ -12,7 +12,6 @@ from typing import Any, Literal
 
 import requests
 
-from arkivari.robots import RobotsPolicy
 from arkivari.spn_config import (
     SPN_CAPTURE_OPTIONS,
     SpnConfig,
@@ -39,11 +38,15 @@ def estimate_archive_seconds(
     page_count: int,
     min_interval_seconds: float = MIN_INTERVAL_SECONDS,
 ) -> float:
-    """Estimate wall-clock time to archive pages at IA rate limits."""
+    """Estimate wall-clock time to archive pages at IA rate limits.
+
+    With concurrent captures, submissions are pipelined at *min_interval_seconds*
+    apart.  Polling happens in parallel, so the dominant cost per page is the
+    submission interval, not interval + capture time.
+    """
     if page_count <= 0:
         return 0.0
-    per_page = min_interval_seconds + ESTIMATED_CAPTURE_SECONDS
-    return ESTIMATED_CAPTURE_SECONDS + (page_count - 1) * per_page
+    return ESTIMATED_CAPTURE_SECONDS + (page_count - 1) * min_interval_seconds
 
 JOB_ID_PATTERN = re.compile(r'watchJob\("([^"]+)"')
 SPN_MESSAGE_PATTERN = re.compile(r'id="spn-message">([^<]+)')
@@ -77,28 +80,6 @@ class ArchiveSummary:
             self.skipped_robots += 1
         elif result.status == "failed":
             self.failed_count += 1
-
-
-class ArchiveRateLimiter:
-    """Enforce Save Page Now per-minute rate limits."""
-
-    def __init__(self, min_interval_seconds: float = MIN_INTERVAL_SECONDS) -> None:
-        self._min_interval_seconds = min_interval_seconds
-        self._last_capture_at = 0.0
-        self._capture_count = 0
-
-    def wait(self) -> None:
-        elapsed = time.monotonic() - self._last_capture_at
-        remaining = self._min_interval_seconds - elapsed
-        if remaining > 0:
-            time.sleep(remaining)
-        self._last_capture_at = time.monotonic()
-
-    def can_capture(self, max_archives: int) -> bool:
-        return self._capture_count < max_archives
-
-    def record_capture(self) -> None:
-        self._capture_count += 1
 
 
 class SpnError(Exception):
@@ -330,11 +311,18 @@ def _run_capture(
 def archive_url(
     url: str,
     user_agent: str,
-    rate_limiter: ArchiveRateLimiter,
     session: requests.Session | None = None,
     spn_config: SpnConfig | None = None,
 ) -> ArchiveResult:
-    """Archive a single URL via Save Page Now."""
+    """Archive a single URL via Save Page Now.
+
+    Rate limiting of submissions is handled by the caller (the session driver
+    acquires a token before dispatching each worker).
+
+    On HTTP 429 the function returns a ``"failed"`` result immediately so
+    the session driver can apply a cooldown to the shared rate limiter and
+    re-queue the URL.  Only transient network errors are retried here.
+    """
     config = spn_config or SpnConfig(
         authenticated=False,
         access_key=None,
@@ -348,25 +336,17 @@ def archive_url(
     backoff = config.min_interval_seconds
 
     for attempt in range(1, MAX_RETRIES + 1):
-        rate_limiter.wait()
         try:
-            result = _run_capture(http, url, user_agent, config)
-            rate_limiter.record_capture()
-            return result
+            return _run_capture(http, url, user_agent, config)
 
         except SpnError as exc:
             message = str(exc)
             if "429" in message or "rate limit" in message.lower():
                 logger.warning(
-                    "Rate limited archiving %s (attempt %d/%d); waiting %.1fs",
+                    "Rate limited archiving %s; returning to queue",
                     url,
-                    attempt,
-                    MAX_RETRIES,
-                    backoff,
                 )
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 120.0)
-                continue
+                return ArchiveResult(url=url, status="failed", error=message[:_MAX_ERROR_LENGTH])
             return ArchiveResult(url=url, status="failed", error=message[:_MAX_ERROR_LENGTH])
 
         except requests.exceptions.RequestException as exc:
@@ -383,69 +363,3 @@ def archive_url(
             backoff = min(backoff * 2, 120.0)
 
     return ArchiveResult(url=url, status="failed", error="Max retries exceeded")
-
-
-def archive_urls(
-    urls: list[str],
-    robots: RobotsPolicy,
-    user_agent: str,
-    max_archives: int = ANONYMOUS_DAILY_CAP,
-    verbose: bool = False,
-    spn_config: SpnConfig | None = None,
-) -> ArchiveSummary:
-    """Archive discovered URLs while respecting robots.txt and IA limits."""
-    config = spn_config
-    if config is None:
-        config = SpnConfig(
-            authenticated=False,
-            access_key=None,
-            secret_key=None,
-            captures_per_minute=ANONYMOUS_CAPTURES_PER_MINUTE,
-            daily_cap=ANONYMOUS_DAILY_CAP,
-            min_interval_seconds=MIN_INTERVAL_SECONDS,
-            capture_options=dict(SPN_CAPTURE_OPTIONS),
-        )
-    summary = ArchiveSummary()
-    rate_limiter = ArchiveRateLimiter(config.min_interval_seconds)
-    session = requests.Session()
-
-    try:
-        for url in urls:
-            if not rate_limiter.can_capture(max_archives):
-                logger.error(
-                    "Reached archive cap of %d URLs (daily limit is %d)",
-                    max_archives,
-                    config.daily_cap,
-                )
-                break
-
-            if not robots.can_fetch(url):
-                result = ArchiveResult(url=url, status="skipped", error="Disallowed by robots.txt")
-                summary.add(result)
-                if verbose:
-                    logger.info("Skipped (robots.txt): %s", url)
-                continue
-
-            result = archive_url(
-                url,
-                user_agent,
-                rate_limiter,
-                session=session,
-                spn_config=config,
-            )
-            summary.add(result)
-
-            if verbose:
-                if result.status == "archived":
-                    logger.info("Archived: %s -> %s", url, result.archive_url)
-                elif result.status == "cached":
-                    logger.info("Already cached: %s -> %s", url, result.archive_url)
-                else:
-                    logger.error("Failed: %s (%s)", url, result.error)
-    except KeyboardInterrupt:
-        logger.warning(
-            "Archive interrupted; %d URL(s) processed in this batch",
-            len(summary.results),
-        )
-
-    return summary
