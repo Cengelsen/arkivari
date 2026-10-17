@@ -12,10 +12,51 @@ from arkivari.spn_config import (
     AUTHENTICATED_DAILY_CAP,
     ACCESS_KEY_ENV,
     SECRET_KEY_ENV,
+    SPN_CAPTURE_OPTIONS,
+    SpnConfig,
+    build_spn_submit_data,
     load_dotenv,
     resolve_daily_limit,
     resolve_spn_config,
+    spn_capture_post_fields,
 )
+
+
+class TestSpnCaptureOptions:
+    def test_resolve_copies_options_dict(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(ACCESS_KEY_ENV, raising=False)
+        monkeypatch.delenv(SECRET_KEY_ENV, raising=False)
+        config = resolve_spn_config()
+        assert config.capture_options == SPN_CAPTURE_OPTIONS
+        config.capture_options["capture_outlinks"] = True
+        assert SPN_CAPTURE_OPTIONS["capture_outlinks"] is False
+
+    def test_post_fields_only_enabled(self) -> None:
+        fields = spn_capture_post_fields({"capture_all": True, "wacz": False})
+        assert fields == {"capture_all": "1"}
+
+    def test_build_submit_data_authenticated(self) -> None:
+        config = SpnConfig(
+            authenticated=True,
+            access_key="a",
+            secret_key="b",
+            captures_per_minute=7,
+            daily_cap=100_000,
+            min_interval_seconds=1.0,
+            capture_options={"capture_all": True, "capture_outlinks": True},
+        )
+        data = build_spn_submit_data("https://example.com/", config, authenticated=True)
+        assert data["url"] == "https://example.com/"
+        assert data["capture_all"] == "1"
+        assert data["capture_outlinks"] == "1"
+        assert data["skip_first_archive"] == "1"
+        assert "wacz" not in data
+
+    def test_build_submit_data_anonymous(self) -> None:
+        config = resolve_spn_config(force_anonymous=True)
+        data = build_spn_submit_data("https://example.com/", config, authenticated=False)
+        assert data["url"] == "https://example.com/"
+        assert "skip_first_archive" not in data
 
 
 class TestResolveSpnConfig:

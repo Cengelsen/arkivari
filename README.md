@@ -88,7 +88,11 @@ Create S3 keys at [archive.org/account/s3.php](https://archive.org/account/s3.ph
 
 arkivari runs captures **sequentially** (one at a time). Internet Archive also limits concurrent pending jobs (12 authenticated) and **10 captures per URL per UTC day**.
 
-Authenticated submits use `capture_all=1`, `skip_first_archive=1`, and `if_not_archived_within=30m` so recent captures count as cached without a full re-capture when possible.
+Authenticated submits also use `skip_first_archive=1` and `if_not_archived_within=30m` so recent captures count as cached without a full re-capture when possible.
+
+### Save Page Now capture options
+
+Edit `SPN_CAPTURE_OPTIONS` in `arkivari/spn_config.py` to turn Save Page Now form options on or off (`True` / `False`). Enabled options are sent on every capture; keys match the [Save Page Now](https://web.archive.org/save/) checkboxes (for example `capture_outlinks`, `wacz`). Screenshot, personal web archive, and email options require S3 keys tied to your Internet Archive account.
 
 Resuming a queue file that still has `daily_limit: 4000` will upgrade to 100,000 when S3 keys are present (unless you pass `--daily-limit`).
 

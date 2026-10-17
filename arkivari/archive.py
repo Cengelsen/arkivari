@@ -13,7 +13,12 @@ from typing import Any, Literal
 import requests
 
 from arkivari.robots import RobotsPolicy
-from arkivari.spn_config import SpnConfig, authorization_header
+from arkivari.spn_config import (
+    SPN_CAPTURE_OPTIONS,
+    SpnConfig,
+    authorization_header,
+    build_spn_submit_data,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -150,11 +155,12 @@ def _submit_capture_anonymous(
     session: requests.Session,
     url: str,
     user_agent: str,
+    spn_config: SpnConfig,
 ) -> tuple[str | None, str | None]:
     """Submit a capture using the browser's POST + async job flow."""
     response = session.post(
         f"{SAVE_PAGE_URL}{url}",
-        data={"url": url, "capture_all": "1"},
+        data=build_spn_submit_data(url, spn_config, authenticated=False),
         headers=_browser_headers(user_agent),
         timeout=30,
     )
@@ -191,12 +197,7 @@ def _submit_capture_authenticated(
             "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
         },
     )
-    data = {
-        "url": url,
-        "capture_all": "1",
-        "skip_first_archive": "1",
-        "if_not_archived_within": spn_config.if_not_archived_within,
-    }
+    data = build_spn_submit_data(url, spn_config, authenticated=True)
     response = session.post(SAVE_PAGE_API, data=data, headers=headers, timeout=30)
 
     if response.status_code == 429:
@@ -312,7 +313,7 @@ def _run_capture(
     if spn_config.authenticated:
         job_id, submit_message = _submit_capture_authenticated(session, url, user_agent, spn_config)
     else:
-        job_id, submit_message = _submit_capture_anonymous(session, url, user_agent)
+        job_id, submit_message = _submit_capture_anonymous(session, url, user_agent, spn_config)
         if not job_id:
             return ArchiveResult(url=url, status="failed", error="No capture job returned")
 
@@ -341,6 +342,7 @@ def archive_url(
         captures_per_minute=ANONYMOUS_CAPTURES_PER_MINUTE,
         daily_cap=ANONYMOUS_DAILY_CAP,
         min_interval_seconds=MIN_INTERVAL_SECONDS,
+        capture_options=dict(SPN_CAPTURE_OPTIONS),
     )
     http = session or requests.Session()
     backoff = config.min_interval_seconds
@@ -401,6 +403,7 @@ def archive_urls(
             captures_per_minute=ANONYMOUS_CAPTURES_PER_MINUTE,
             daily_cap=ANONYMOUS_DAILY_CAP,
             min_interval_seconds=MIN_INTERVAL_SECONDS,
+            capture_options=dict(SPN_CAPTURE_OPTIONS),
         )
     summary = ArchiveSummary()
     rate_limiter = ArchiveRateLimiter(config.min_interval_seconds)

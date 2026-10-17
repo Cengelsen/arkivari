@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 
 ACCESS_KEY_ENV = "SAVEPAGENOW_ACCESS_KEY"
@@ -15,6 +16,27 @@ AUTHENTICATED_CAPTURES_PER_MINUTE = 7
 AUTHENTICATED_DAILY_CAP = 100_000
 IF_NOT_ARCHIVED_WITHIN = "30m"
 
+# Toggle Save Page Now capture options (same names as the web.archive.org/save form).
+# Screenshot, my web archive, email, and WACZ require an Internet Archive account (S3 keys).
+SPN_CAPTURE_OPTIONS: dict[str, bool] = {
+    "capture_all": True,  # Save error pages (HTTP 4xx, 5xx)
+    "capture_outlinks": True,  # Save outlinks (up to 100 per page)
+    "capture_screenshot": False,
+    "disable_adblocker": False,
+    "wm-save-mywebarchive": False,  # Save also in my web archive
+    "email_result": False,  # Email me the results
+    "wacz": False,  # Email me a WACZ file with the results
+}
+
+
+def _default_capture_options() -> dict[str, bool]:
+    return dict(SPN_CAPTURE_OPTIONS)
+
+
+def spn_capture_post_fields(capture_options: Mapping[str, bool]) -> dict[str, str]:
+    """Form fields for enabled SPN options (value ``1`` when True)."""
+    return {name: "1" for name, enabled in capture_options.items() if enabled}
+
 
 @dataclass(frozen=True)
 class SpnConfig:
@@ -25,10 +47,20 @@ class SpnConfig:
     daily_cap: int
     min_interval_seconds: float
     if_not_archived_within: str = IF_NOT_ARCHIVED_WITHIN
+    capture_options: dict[str, bool] = field(default_factory=_default_capture_options)
 
     @property
     def mode_label(self) -> str:
         return "authenticated" if self.authenticated else "anonymous"
+
+
+def build_spn_submit_data(url: str, spn_config: SpnConfig, *, authenticated: bool) -> dict[str, str]:
+    """POST body for a Save Page Now capture request."""
+    data: dict[str, str] = {"url": url, **spn_capture_post_fields(spn_config.capture_options)}
+    if authenticated:
+        data["skip_first_archive"] = "1"
+        data["if_not_archived_within"] = spn_config.if_not_archived_within
+    return data
 
 
 def load_dotenv(path: Path | None = None) -> None:
@@ -74,6 +106,7 @@ def resolve_spn_config(force_anonymous: bool = False) -> SpnConfig:
             captures_per_minute=AUTHENTICATED_CAPTURES_PER_MINUTE,
             daily_cap=AUTHENTICATED_DAILY_CAP,
             min_interval_seconds=interval,
+            capture_options=dict(SPN_CAPTURE_OPTIONS),
         )
     return _anonymous_config()
 
@@ -86,6 +119,7 @@ def _anonymous_config() -> SpnConfig:
         captures_per_minute=ANONYMOUS_CAPTURES_PER_MINUTE,
         daily_cap=ANONYMOUS_DAILY_CAP,
         min_interval_seconds=60.0 / ANONYMOUS_CAPTURES_PER_MINUTE,
+        capture_options=dict(SPN_CAPTURE_OPTIONS),
     )
 
 
