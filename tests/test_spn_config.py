@@ -14,10 +14,15 @@ from arkivari.spn_config import (
     AUTHENTICATED_DAILY_CAP,
     AUTHENTICATED_MAX_CONCURRENT,
     ACCESS_KEY_ENV,
+    LOGGED_IN_SIG_ENV,
+    LOGGED_IN_USER_ENV,
+    PREFER_COOKIES_ENV,
     SECRET_KEY_ENV,
     SPN_CAPTURE_OPTIONS,
     SpnConfig,
+    apply_spn_auth_headers,
     build_spn_submit_data,
+    cookie_header,
     discover_dotenv_path,
     load_dotenv,
     resolve_daily_limit,
@@ -42,6 +47,7 @@ class TestSpnCaptureOptions:
     def test_build_submit_data_authenticated(self) -> None:
         config = SpnConfig(
             authenticated=True,
+            auth_method="s3",
             access_key="a",
             secret_key="b",
             captures_per_minute=7,
@@ -78,9 +84,57 @@ class TestResolveSpnConfig:
         monkeypatch.setenv(SECRET_KEY_ENV, "test-secret")
         config = resolve_spn_config()
         assert config.authenticated
+        assert config.auth_method == "s3"
         assert config.daily_cap == AUTHENTICATED_DAILY_CAP
         assert config.captures_per_minute == 7
         assert config.max_concurrent == AUTHENTICATED_MAX_CONCURRENT
+
+    def test_authenticated_with_cookies_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(ACCESS_KEY_ENV, raising=False)
+        monkeypatch.delenv(SECRET_KEY_ENV, raising=False)
+        monkeypatch.setenv(LOGGED_IN_SIG_ENV, "sig-value")
+        monkeypatch.setenv(LOGGED_IN_USER_ENV, "user%40example.org")
+        config = resolve_spn_config()
+        assert config.authenticated
+        assert config.auth_method == "cookies"
+        assert config.mode_label == "authenticated (cookies)"
+        assert cookie_header(config) == (
+            "logged-in-sig=sig-value; logged-in-user=user%40example.org"
+        )
+
+    def test_prefers_s3_when_both_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(ACCESS_KEY_ENV, "a")
+        monkeypatch.setenv(SECRET_KEY_ENV, "b")
+        monkeypatch.setenv(LOGGED_IN_SIG_ENV, "sig")
+        monkeypatch.setenv(LOGGED_IN_USER_ENV, "u")
+        config = resolve_spn_config()
+        assert config.auth_method == "s3"
+
+    def test_prefers_cookies_when_flag_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(ACCESS_KEY_ENV, "a")
+        monkeypatch.setenv(SECRET_KEY_ENV, "b")
+        monkeypatch.setenv(LOGGED_IN_SIG_ENV, "sig")
+        monkeypatch.setenv(LOGGED_IN_USER_ENV, "u")
+        monkeypatch.setenv(PREFER_COOKIES_ENV, "1")
+        config = resolve_spn_config()
+        assert config.auth_method == "cookies"
+
+    def test_apply_spn_auth_headers_cookie(self) -> None:
+        config = SpnConfig(
+            authenticated=True,
+            auth_method="cookies",
+            access_key=None,
+            secret_key=None,
+            logged_in_sig="abc",
+            logged_in_user="me%40archive.org",
+            captures_per_minute=7,
+            daily_cap=100_000,
+            min_interval_seconds=1.0,
+        )
+        headers: dict[str, str] = {}
+        apply_spn_auth_headers(headers, config)
+        assert "Cookie" in headers
+        assert "Authorization" not in headers
 
     def test_force_anonymous(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(ACCESS_KEY_ENV, "test-access")

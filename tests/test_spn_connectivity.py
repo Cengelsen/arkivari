@@ -13,6 +13,7 @@ from arkivari.spn_config import SpnConfig
 def _auth_config() -> SpnConfig:
     return SpnConfig(
         authenticated=True,
+        auth_method="s3",
         access_key="access",
         secret_key="secret",
         captures_per_minute=7,

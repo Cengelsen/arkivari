@@ -16,6 +16,7 @@ from arkivari.rate_limiter import CrawlRateLimiter
 from arkivari.spn_config import (
     SPN_CAPTURE_OPTIONS,
     SpnConfig,
+    apply_spn_auth_headers,
     authorization_header,
     build_spn_submit_data,
 )
@@ -171,15 +172,15 @@ def check_spn_submit_auth(
     *,
     timeout: float = IA_CONNECTIVITY_TIMEOUT_SECONDS,
 ) -> tuple[bool, str | None]:
-    """Probe Save Page Now JSON API accepts the configured S3 credentials."""
+    """Probe Save Page Now JSON API accepts the configured credentials."""
     headers = _browser_headers(
         user_agent,
         {
             "Accept": "application/json",
-            "Authorization": authorization_header(spn_config),
             "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
         },
     )
+    apply_spn_auth_headers(headers, spn_config)
     try:
         response = session.post(
             SAVE_PAGE_API,
@@ -204,11 +205,17 @@ def check_spn_submit_auth(
 
     if response.status_code == 401:
         snippet = response.text[:200].replace("\n", " ")
+        hint = (
+            "Refresh SAVEPAGENOW_LOGGED_IN_* cookies from the browser"
+            if spn_config.auth_method == "cookies"
+            else "Keys may be invalid for SPN even when archive.org login works "
+            "(browser cookies vs S3); try SAVEPAGENOW_* cookie auth or "
+            "SAVEPAGENOW_PREFER_COOKIES=1"
+        )
         return (
             False,
-            "Save Page Now rejected credentials (HTTP 401). "
-            "Keys may be invalid for SPN even when archive.org login works "
-            f"(browser cookies vs S3). Response: {snippet}",
+            f"Save Page Now rejected credentials (HTTP 401). {hint} "
+            f"Response: {snippet}",
         )
 
     snippet = response.text[:200].replace("\n", " ")
@@ -231,9 +238,13 @@ def verify_spn_credentials(
         return True, None, None
 
     http = session or requests.Session()
-    s3_ok, s3_err, username = check_ia_s3_credentials(spn_config, http, timeout=timeout)
-    if not s3_ok:
-        return False, s3_err, None
+    username: str | None = None
+    if spn_config.auth_method == "s3":
+        s3_ok, s3_err, username = check_ia_s3_credentials(spn_config, http, timeout=timeout)
+        if not s3_ok:
+            return False, s3_err, None
+    elif spn_config.auth_method == "cookies":
+        username = spn_config.logged_in_user
 
     spn_ok, spn_err = check_spn_submit_auth(spn_config, http, user_agent, timeout=timeout)
     if not spn_ok:
@@ -350,10 +361,10 @@ def _submit_capture_authenticated(
         user_agent,
         {
             "Accept": "application/json",
-            "Authorization": authorization_header(spn_config),
             "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
         },
     )
+    apply_spn_auth_headers(headers, spn_config)
     data = build_spn_submit_data(url, spn_config, authenticated=True)
     response = session.post(SAVE_PAGE_API, data=data, headers=headers, timeout=30)
 
@@ -399,7 +410,7 @@ def _poll_capture(
     deadline = time.monotonic() + MAX_POLL_SECONDS
     poll_headers = _browser_headers(user_agent, {"Accept": "application/json"})
     if spn_config.authenticated:
-        poll_headers["Authorization"] = authorization_header(spn_config)
+        apply_spn_auth_headers(poll_headers, spn_config)
 
     while time.monotonic() < deadline:
         if poll_limiter is not None:
@@ -515,8 +526,11 @@ def archive_url(
     """
     config = spn_config or SpnConfig(
         authenticated=False,
+        auth_method=None,
         access_key=None,
         secret_key=None,
+        logged_in_sig=None,
+        logged_in_user=None,
         captures_per_minute=ANONYMOUS_CAPTURES_PER_MINUTE,
         daily_cap=ANONYMOUS_DAILY_CAP,
         min_interval_seconds=MIN_INTERVAL_SECONDS,

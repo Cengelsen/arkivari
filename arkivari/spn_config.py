@@ -6,11 +6,17 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 ACCESS_KEY_ENV = "SAVEPAGENOW_ACCESS_KEY"
 ANONYMOUS_CAPTURES_PER_MINUTE = 6
 ANONYMOUS_DAILY_CAP = 4000
 SECRET_KEY_ENV = "SAVEPAGENOW_SECRET_KEY"
+LOGGED_IN_SIG_ENV = "SAVEPAGENOW_LOGGED_IN_SIG"
+LOGGED_IN_USER_ENV = "SAVEPAGENOW_LOGGED_IN_USER"
+PREFER_COOKIES_ENV = "SAVEPAGENOW_PREFER_COOKIES"
+
+SpnAuthMethod = Literal["s3", "cookies"]
 
 AUTHENTICATED_CAPTURES_PER_MINUTE = 7
 AUTHENTICATED_DAILY_CAP = 100_000
@@ -25,7 +31,15 @@ AUTHENTICATED_MAX_CONCURRENT = 7
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 _DOTENV_PARENT_WALK_MAX = 5
-_SPN_ENV_KEYS = frozenset({ACCESS_KEY_ENV, SECRET_KEY_ENV})
+_SPN_ENV_KEYS = frozenset(
+    {
+        ACCESS_KEY_ENV,
+        SECRET_KEY_ENV,
+        LOGGED_IN_SIG_ENV,
+        LOGGED_IN_USER_ENV,
+        PREFER_COOKIES_ENV,
+    }
+)
 
 # Toggle Save Page Now capture options (same names as the web.archive.org/save form).
 # Screenshot, my web archive, email, and WACZ require an Internet Archive account (S3 keys).
@@ -57,13 +71,20 @@ class SpnConfig:
     captures_per_minute: int
     daily_cap: int
     min_interval_seconds: float
+    auth_method: SpnAuthMethod | None = None
+    logged_in_sig: str | None = None
+    logged_in_user: str | None = None
     if_not_archived_within: str = IF_NOT_ARCHIVED_WITHIN
     max_concurrent: int = ANONYMOUS_MAX_CONCURRENT
     capture_options: dict[str, bool] = field(default_factory=_default_capture_options)
 
     @property
     def mode_label(self) -> str:
-        return "authenticated" if self.authenticated else "anonymous"
+        if not self.authenticated:
+            return "anonymous"
+        if self.auth_method == "cookies":
+            return "authenticated (cookies)"
+        return "authenticated"
 
 
 def build_spn_submit_data(url: str, spn_config: SpnConfig, *, authenticated: bool) -> dict[str, str]:
@@ -148,6 +169,10 @@ def load_dotenv(path: Path | None = None) -> None:
             os.environ[key] = value
 
 
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def resolve_spn_config(force_anonymous: bool = False) -> SpnConfig:
     """Build SPN config from environment (call load_dotenv first)."""
     if force_anonymous:
@@ -155,26 +180,68 @@ def resolve_spn_config(force_anonymous: bool = False) -> SpnConfig:
 
     access_key = os.environ.get(ACCESS_KEY_ENV, "").strip()
     secret_key = os.environ.get(SECRET_KEY_ENV, "").strip()
-    if access_key and secret_key:
-        interval = 60.0 / AUTHENTICATED_CAPTURES_PER_MINUTE
-        return SpnConfig(
-            authenticated=True,
+    logged_in_sig = os.environ.get(LOGGED_IN_SIG_ENV, "").strip()
+    logged_in_user = os.environ.get(LOGGED_IN_USER_ENV, "").strip()
+    has_s3 = bool(access_key and secret_key)
+    has_cookies = bool(logged_in_sig and logged_in_user)
+
+    if has_s3 and has_cookies and not _env_truthy(PREFER_COOKIES_ENV):
+        return _authenticated_config(
+            "s3",
             access_key=access_key,
             secret_key=secret_key,
-            captures_per_minute=AUTHENTICATED_CAPTURES_PER_MINUTE,
-            daily_cap=AUTHENTICATED_DAILY_CAP,
-            min_interval_seconds=interval,
-            max_concurrent=AUTHENTICATED_MAX_CONCURRENT,
-            capture_options=dict(SPN_CAPTURE_OPTIONS),
+            logged_in_sig=logged_in_sig,
+            logged_in_user=logged_in_user,
+        )
+    if has_cookies and (not has_s3 or _env_truthy(PREFER_COOKIES_ENV)):
+        return _authenticated_config(
+            "cookies",
+            access_key=access_key if access_key else None,
+            secret_key=secret_key if secret_key else None,
+            logged_in_sig=logged_in_sig,
+            logged_in_user=logged_in_user,
+        )
+    if has_s3:
+        return _authenticated_config(
+            "s3",
+            access_key=access_key,
+            secret_key=secret_key,
         )
     return _anonymous_config()
+
+
+def _authenticated_config(
+    auth_method: SpnAuthMethod,
+    *,
+    access_key: str | None = None,
+    secret_key: str | None = None,
+    logged_in_sig: str | None = None,
+    logged_in_user: str | None = None,
+) -> SpnConfig:
+    interval = 60.0 / AUTHENTICATED_CAPTURES_PER_MINUTE
+    return SpnConfig(
+        authenticated=True,
+        auth_method=auth_method,
+        access_key=access_key,
+        secret_key=secret_key,
+        logged_in_sig=logged_in_sig,
+        logged_in_user=logged_in_user,
+        captures_per_minute=AUTHENTICATED_CAPTURES_PER_MINUTE,
+        daily_cap=AUTHENTICATED_DAILY_CAP,
+        min_interval_seconds=interval,
+        max_concurrent=AUTHENTICATED_MAX_CONCURRENT,
+        capture_options=dict(SPN_CAPTURE_OPTIONS),
+    )
 
 
 def _anonymous_config() -> SpnConfig:
     return SpnConfig(
         authenticated=False,
+        auth_method=None,
         access_key=None,
         secret_key=None,
+        logged_in_sig=None,
+        logged_in_user=None,
         captures_per_minute=ANONYMOUS_CAPTURES_PER_MINUTE,
         daily_cap=ANONYMOUS_DAILY_CAP,
         min_interval_seconds=60.0 / ANONYMOUS_CAPTURES_PER_MINUTE,
@@ -183,9 +250,23 @@ def _anonymous_config() -> SpnConfig:
 
 
 def authorization_header(config: SpnConfig) -> str:
-    if not config.authenticated or not config.access_key or not config.secret_key:
-        raise ValueError("authorization_header requires authenticated SpnConfig with keys")
+    if config.auth_method != "s3" or not config.access_key or not config.secret_key:
+        raise ValueError("authorization_header requires SpnConfig with auth_method s3 and keys")
     return f"LOW {config.access_key}:{config.secret_key}"
+
+
+def cookie_header(config: SpnConfig) -> str:
+    if config.auth_method != "cookies" or not config.logged_in_sig or not config.logged_in_user:
+        raise ValueError("cookie_header requires SpnConfig with auth_method cookies")
+    return f"logged-in-sig={config.logged_in_sig}; logged-in-user={config.logged_in_user}"
+
+
+def apply_spn_auth_headers(headers: dict[str, str], config: SpnConfig) -> None:
+    """Add S3 ``Authorization`` or session ``Cookie`` per ``config.auth_method``."""
+    if config.auth_method == "s3":
+        headers["Authorization"] = authorization_header(config)
+    elif config.auth_method == "cookies":
+        headers["Cookie"] = cookie_header(config)
 
 
 def resolve_daily_limit(

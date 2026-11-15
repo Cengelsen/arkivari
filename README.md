@@ -77,9 +77,14 @@ Exit codes: `0` success, `1` partial failure (some archives failed), `2` fatal e
 
 ## Internet Archive limits
 
-arkivari loads optional credentials from a `.env` file (gitignored) or the environment. When both `SAVEPAGENOW_ACCESS_KEY` and `SAVEPAGENOW_SECRET_KEY` are set, it uses the [SPN2 API](https://archive.org/account/s3.php) automatically (`Authorization: LOW access:secret`). Use `--anonymous` to force anonymous mode.
+arkivari loads optional credentials from a `.env` file (gitignored) or the environment. Authenticated mode uses the [SPN2 JSON API](https://archive.org/account/s3.php) with either:
 
-`.env` is searched in order: current working directory, the arkivari repository root, then up to five parent directories of the cwd. Pass `--env-file PATH` to load a specific file. Values of `SAVEPAGENOW_ACCESS_KEY` and `SAVEPAGENOW_SECRET_KEY` in `.env` **override** the same variables already exported in your shell (other keys in `.env` only apply when not already set in the environment).
+- **S3 keys** — `SAVEPAGENOW_ACCESS_KEY` and `SAVEPAGENOW_SECRET_KEY` (`Authorization: LOW access:secret`), or
+- **Browser session cookies** — `SAVEPAGENOW_LOGGED_IN_SIG` and `SAVEPAGENOW_LOGGED_IN_USER` (same names as on [archive.org](https://archive.org); copy values from DevTools → Application → Cookies while logged in). Cookie values expire after a few days; refresh them when auth fails.
+
+If both S3 keys and cookies are set, S3 is used unless `SAVEPAGENOW_PREFER_COOKIES=1` is set (useful when S3 keys fail but the web UI still works). Use `--anonymous` to force anonymous mode.
+
+`.env` is searched in order: current working directory, the arkivari repository root, then up to five parent directories of the cwd. Pass `--env-file PATH` to load a specific file. All `SAVEPAGENOW_*` variables in `.env` **override** the same names already exported in your shell (other keys in `.env` only apply when not already set in the environment).
 
 Before archiving (and for `--status` / `--dry-run` when keys are present), arkivari checks [IA-S3 `check_auth`](https://archive.org/developers/ias3.html) and a minimal Save Page Now submit probe. Invalid keys exit with code `2` instead of re-queuing thousands of URLs.
 
