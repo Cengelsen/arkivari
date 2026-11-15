@@ -26,8 +26,8 @@ IF_NOT_ARCHIVED_WITHIN = "30m"
 # globally, but having too many concurrent captures on the *same host* triggers
 # IA's "host overloaded" throttling.  Since arkivari archives one domain at a
 # time, keep these conservative.
-ANONYMOUS_MAX_CONCURRENT = 6
-AUTHENTICATED_MAX_CONCURRENT = 7
+ANONYMOUS_MAX_CONCURRENT = 5
+AUTHENTICATED_MAX_CONCURRENT = 6
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 _DOTENV_PARENT_WALK_MAX = 5
