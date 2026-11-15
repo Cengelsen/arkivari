@@ -27,8 +27,12 @@ SAVE_PAGE_URL = "https://web.archive.org/save/"
 SAVE_PAGE_API = "https://web.archive.org/save"
 SPN_SYSTEM_STATUS_URL = f"{SAVE_PAGE_URL}status/system"
 IA_S3_CHECK_AUTH_URL = "https://s3.us.archive.org/"
-SPN_AUTH_PROBE_URL = "https://example.com/"
 WAYBACK_BASE = "https://web.archive.org"
+
+
+def _spn_auth_probe_url() -> str:
+    """Unique probe URL so IA does not return a recent-capture response without ``job_id``."""
+    return f"https://example.com/arkivari-spn-auth-probe-{time.time_ns()}"
 
 IA_CONNECTIVITY_TIMEOUT_SECONDS = 15.0
 
@@ -181,10 +185,11 @@ def check_spn_submit_auth(
         },
     )
     apply_spn_auth_headers(headers, spn_config)
+    probe_url = _spn_auth_probe_url()
     try:
         response = session.post(
             SAVE_PAGE_API,
-            data={"url": SPN_AUTH_PROBE_URL},
+            data={"url": probe_url},
             headers=headers,
             timeout=timeout,
         )
@@ -201,7 +206,15 @@ def check_spn_submit_auth(
             return False, "Save Page Now probe returned HTTP 200 but invalid JSON"
         if payload.get("job_id"):
             return True, None
-        return False, "Save Page Now probe returned HTTP 200 without job_id"
+        message = payload.get("message")
+        if isinstance(message, str) and _is_cached_message(message):
+            return True, None
+        snippet = json.dumps(payload, ensure_ascii=True)[:_MAX_ERROR_LENGTH]
+        return (
+            False,
+            "Save Page Now probe returned HTTP 200 without job_id "
+            f"(auth may still be invalid or IA returned an unexpected body): {snippet}",
+        )
 
     if response.status_code == 401:
         snippet = response.text[:200].replace("\n", " ")

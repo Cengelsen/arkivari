@@ -84,6 +84,20 @@ class TestCheckSpnSubmitAuth:
         assert err is not None
         assert "401" in err
 
+    def test_recent_capture_without_job_id_counts_as_auth_ok(self) -> None:
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "url": "https://example.com/",
+            "message": "Same snapshot is already available (recent capture).",
+        }
+        session = MagicMock()
+        session.post.return_value = response
+
+        ok, err = check_spn_submit_auth(_auth_config(), session, "test-agent")
+        assert ok is True
+        assert err is None
+
 
 class TestCheckSpnSubmitAuthCookies:
     def test_cookie_probe_sends_cookie_header(self) -> None:
