@@ -20,6 +20,7 @@ from arkivari.archive import (
     MIN_INTERVAL_SECONDS,
     ArchiveSummary,
     estimate_archive_seconds,
+    verify_spn_credentials,
 )
 from arkivari.discover import DiscoveryStats, discover_urls, normalize_domain
 from arkivari.quota import utc_today_iso
@@ -65,6 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--anonymous",
         action="store_true",
         help="Force anonymous Save Page Now even if SAVEPAGENOW_* keys are set",
+    )
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        help="Path to .env file (default: search cwd, repo root, then parents)",
     )
     parser.add_argument(
         "--max-archives",
@@ -131,6 +138,26 @@ def build_parser() -> argparse.ArgumentParser:
         version=f"%(prog)s {__version__}",
     )
     return parser
+
+
+def _verify_spn_credentials_or_exit(
+    spn_config: SpnConfig,
+    user_agent: str,
+    session: requests.Session,
+    log: logging.Logger,
+) -> int | None:
+    """Return exit code 2 on auth failure, or None if OK / not authenticated."""
+    if not spn_config.authenticated:
+        return None
+    ok, err, username = verify_spn_credentials(spn_config, user_agent, session)
+    if not ok:
+        log.error("%s", err)
+        return 2
+    if username:
+        log.info("Internet Archive credentials OK (S3 user %s)", username)
+    else:
+        log.info("Internet Archive credentials OK (S3 and Save Page Now)")
+    return None
 
 
 def _format_duration(seconds: float) -> str:
@@ -399,7 +426,11 @@ def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     args = parser.parse_args(argv)
 
-    load_dotenv()
+    if args.env_file is not None and not args.env_file.is_file():
+        print(f"Env file not found: {args.env_file}", file=sys.stderr)
+        return 2
+
+    load_dotenv(args.env_file)
     spn_config = resolve_spn_config(force_anonymous=args.anonymous)
     user_set_daily_limit = "--daily-limit" in argv or "--max-archives" in argv
 
@@ -434,6 +465,11 @@ def main(argv: list[str] | None = None) -> int:
         if existing_queue is None:
             log.error("No queue file found at %s", queue_path)
             return 2
+        auth_exit = _verify_spn_credentials_or_exit(
+            spn_config, args.user_agent, session, log
+        )
+        if auth_exit is not None:
+            return auth_exit
         status_limit = resolve_daily_limit(
             args.daily_limit,
             spn_config,
@@ -514,6 +550,11 @@ def main(argv: list[str] | None = None) -> int:
             print_validation_overview(validation_stats)
 
         if args.dry_run:
+            auth_exit = _verify_spn_credentials_or_exit(
+                spn_config, args.user_agent, session, log
+            )
+            if auth_exit is not None:
+                return auth_exit
             log.info(
                 "Dry run: %d URLs after validation (%d archivable)",
                 len(discovered_urls),
@@ -600,6 +641,12 @@ def main(argv: list[str] | None = None) -> int:
             queue.archived_today_utc,
             queue.daily_limit,
         )
+
+    auth_exit = _verify_spn_credentials_or_exit(
+        spn_config, args.user_agent, session, log
+    )
+    if auth_exit is not None:
+        return auth_exit
 
     if args.until_complete:
         log.info(

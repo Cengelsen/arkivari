@@ -23,6 +23,10 @@ IF_NOT_ARCHIVED_WITHIN = "30m"
 ANONYMOUS_MAX_CONCURRENT = 6
 AUTHENTICATED_MAX_CONCURRENT = 7
 
+_PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+_DOTENV_PARENT_WALK_MAX = 5
+_SPN_ENV_KEYS = frozenset({ACCESS_KEY_ENV, SECRET_KEY_ENV})
+
 # Toggle Save Page Now capture options (same names as the web.archive.org/save form).
 # Screenshot, my web archive, email, and WACZ require an Internet Archive account (S3 keys).
 SPN_CAPTURE_OPTIONS: dict[str, bool] = {
@@ -71,20 +75,47 @@ def build_spn_submit_data(url: str, spn_config: SpnConfig, *, authenticated: boo
     return data
 
 
-def load_dotenv(path: Path | None = None) -> None:
-    """Load environment variables from a .env file into os.environ (no override)."""
-    env_path = path or Path.cwd() / ".env"
-    if not env_path.is_file():
-        return
+def discover_dotenv_path(explicit: Path | None = None) -> Path | None:
+    """
+    Locate a `.env` file for credential loading.
 
+    Order: explicit path, ``cwd/.env``, package repo root, then up to five parents of cwd.
+    """
+    if explicit is not None:
+        return explicit if explicit.is_file() else None
+
+    candidates: list[Path] = [
+        Path.cwd() / ".env",
+        _PACKAGE_ROOT / ".env",
+    ]
+    current = Path.cwd()
+    for _ in range(_DOTENV_PARENT_WALK_MAX):
+        current = current.parent
+        if not current or current == current.parent:
+            break
+        candidates.append(current / ".env")
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _parse_dotenv_file(env_path: Path) -> dict[str, str]:
     try:
-        from dotenv import load_dotenv as _dotenv_load
+        from dotenv import dotenv_values
 
-        _dotenv_load(env_path, override=False)
-        return
+        raw = dotenv_values(env_path)
+        return {key: value for key, value in raw.items() if key and value is not None}
     except ImportError:
         pass
 
+    parsed: dict[str, str] = {}
     for line in env_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -94,7 +125,26 @@ def load_dotenv(path: Path | None = None) -> None:
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip("'").strip('"')
-        if key and key not in os.environ:
+        if key:
+            parsed[key] = value
+    return parsed
+
+
+def load_dotenv(path: Path | None = None) -> None:
+    """
+    Load environment variables from a `.env` file into ``os.environ``.
+
+    ``SAVEPAGENOW_*`` keys from the file always override existing shell values.
+    Other keys are set only when not already in the environment.
+    """
+    env_path = discover_dotenv_path(path)
+    if env_path is None:
+        return
+
+    for key, value in _parse_dotenv_file(env_path).items():
+        if key in _SPN_ENV_KEYS:
+            os.environ[key] = value
+        elif key not in os.environ:
             os.environ[key] = value
 
 

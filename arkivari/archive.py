@@ -24,7 +24,12 @@ logger = logging.getLogger(__name__)
 
 SAVE_PAGE_URL = "https://web.archive.org/save/"
 SAVE_PAGE_API = "https://web.archive.org/save"
+SPN_SYSTEM_STATUS_URL = f"{SAVE_PAGE_URL}status/system"
+IA_S3_CHECK_AUTH_URL = "https://s3.us.archive.org/"
+SPN_AUTH_PROBE_URL = "https://example.com/"
 WAYBACK_BASE = "https://web.archive.org"
+
+IA_CONNECTIVITY_TIMEOUT_SECONDS = 15.0
 
 ANONYMOUS_CAPTURES_PER_MINUTE = 3
 ANONYMOUS_DAILY_CAP = 4000
@@ -107,6 +112,170 @@ def _extract_html_error_message(html: str) -> str | None:
     if title_match:
         return unescape(title_match.group(1).strip())
     return None
+
+
+def check_ia_s3_credentials(
+    spn_config: SpnConfig,
+    session: requests.Session,
+    *,
+    timeout: float = IA_CONNECTIVITY_TIMEOUT_SECONDS,
+) -> tuple[bool, str | None, str | None]:
+    """
+    Validate IA-S3 keys via ``check_auth``.
+
+    Returns ``(ok, error_message, username_or_none)``.
+    """
+    try:
+        response = session.get(
+            IA_S3_CHECK_AUTH_URL,
+            params={"check_auth": "1"},
+            headers={
+                "Authorization": authorization_header(spn_config),
+                "Accept": "application/json",
+            },
+            timeout=timeout,
+        )
+    except requests.exceptions.RequestException as exc:
+        return False, str(exc), None
+
+    if response.status_code >= 500:
+        return False, f"S3 check_auth returned HTTP {response.status_code}", None
+
+    try:
+        payload = response.json()
+    except ValueError:
+        snippet = response.text[:200].replace("\n", " ")
+        return False, f"S3 check_auth invalid JSON: {snippet}", None
+
+    if payload.get("authorized") is True:
+        username = payload.get("username")
+        if isinstance(username, str):
+            return True, None, username
+        return True, None, None
+
+    error = payload.get("error")
+    if isinstance(error, str) and error.strip():
+        return False, f"S3 credentials rejected: {error.strip()}", None
+    return (
+        False,
+        "S3 credentials rejected (authorized=false). "
+        "Regenerate keys at https://archive.org/account/s3.php",
+        None,
+    )
+
+
+def check_spn_submit_auth(
+    spn_config: SpnConfig,
+    session: requests.Session,
+    user_agent: str,
+    *,
+    timeout: float = IA_CONNECTIVITY_TIMEOUT_SECONDS,
+) -> tuple[bool, str | None]:
+    """Probe Save Page Now JSON API accepts the configured S3 credentials."""
+    headers = _browser_headers(
+        user_agent,
+        {
+            "Accept": "application/json",
+            "Authorization": authorization_header(spn_config),
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        },
+    )
+    try:
+        response = session.post(
+            SAVE_PAGE_API,
+            data={"url": SPN_AUTH_PROBE_URL},
+            headers=headers,
+            timeout=timeout,
+        )
+    except requests.exceptions.RequestException as exc:
+        return False, str(exc)
+
+    if response.status_code == 429:
+        return True, None
+
+    if response.status_code == 200:
+        try:
+            payload = response.json()
+        except ValueError:
+            return False, "Save Page Now probe returned HTTP 200 but invalid JSON"
+        if payload.get("job_id"):
+            return True, None
+        return False, "Save Page Now probe returned HTTP 200 without job_id"
+
+    if response.status_code == 401:
+        snippet = response.text[:200].replace("\n", " ")
+        return (
+            False,
+            "Save Page Now rejected credentials (HTTP 401). "
+            "Keys may be invalid for SPN even when archive.org login works "
+            f"(browser cookies vs S3). Response: {snippet}",
+        )
+
+    snippet = response.text[:200].replace("\n", " ")
+    return False, f"Save Page Now probe failed with HTTP {response.status_code}: {snippet}"
+
+
+def verify_spn_credentials(
+    spn_config: SpnConfig,
+    user_agent: str,
+    session: requests.Session | None = None,
+    *,
+    timeout: float = IA_CONNECTIVITY_TIMEOUT_SECONDS,
+) -> tuple[bool, str | None, str | None]:
+    """
+    Verify authenticated SPN is usable.
+
+    Returns ``(ok, error_message, ia_username_or_none)``.
+    """
+    if not spn_config.authenticated:
+        return True, None, None
+
+    http = session or requests.Session()
+    s3_ok, s3_err, username = check_ia_s3_credentials(spn_config, http, timeout=timeout)
+    if not s3_ok:
+        return False, s3_err, None
+
+    spn_ok, spn_err = check_spn_submit_auth(spn_config, http, user_agent, timeout=timeout)
+    if not spn_ok:
+        return False, spn_err, username
+
+    return True, None, username
+
+
+def check_spn_connectivity(
+    session: requests.Session | None = None,
+    timeout: float = IA_CONNECTIVITY_TIMEOUT_SECONDS,
+    *,
+    spn_config: SpnConfig | None = None,
+    user_agent: str | None = None,
+) -> tuple[bool, str | None]:
+    """Return whether Save Page Now is reachable; validate S3 when configured."""
+    http = session or requests.Session()
+    try:
+        response = http.get(
+            SPN_SYSTEM_STATUS_URL,
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+        )
+    except requests.exceptions.RequestException as exc:
+        return False, str(exc)
+
+    if response.status_code >= 500:
+        return False, f"Internet Archive returned HTTP {response.status_code}"
+
+    if spn_config and spn_config.authenticated:
+        if not user_agent:
+            return False, "user_agent required to verify authenticated Save Page Now"
+        ok, err, _username = verify_spn_credentials(
+            spn_config,
+            user_agent,
+            http,
+            timeout=timeout,
+        )
+        if not ok:
+            return False, err
+
+    return True, None
 
 
 def _browser_headers(user_agent: str, extra: dict[str, str] | None = None) -> dict[str, str]:

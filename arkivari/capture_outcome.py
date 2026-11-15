@@ -18,6 +18,7 @@ class CaptureOutcomeKind(str, Enum):
     DEFERRED_POLL_TIMEOUT = "deferred_poll_timeout"
     DEFERRED_HOST_OVERLOAD = "deferred_host_overload"
     DEFERRED_IA_BUSY = "deferred_ia_busy"
+    DEFERRED_NETWORK_ERROR = "deferred_network_error"
     BLOCKED_DAILY_URL_CAP = "blocked_daily_url_cap"
     CAPTURE_ERROR = "capture_error"
 
@@ -28,8 +29,33 @@ DEFERRED_OUTCOMES = frozenset(
         CaptureOutcomeKind.DEFERRED_POLL_TIMEOUT,
         CaptureOutcomeKind.DEFERRED_HOST_OVERLOAD,
         CaptureOutcomeKind.DEFERRED_IA_BUSY,
+        CaptureOutcomeKind.DEFERRED_NETWORK_ERROR,
     }
 )
+
+
+def is_network_connection_error(error: str | None) -> bool:
+    """True when the failure is a transport-level problem reaching IA, not an SPN job error."""
+    if not error:
+        return False
+
+    lowered = error.lower()
+    if "timed out waiting for internet archive job" in lowered:
+        return False
+
+    markers = (
+        "connection refused",
+        "failed to establish a new connection",
+        "newconnectionerror",
+        "connection aborted",
+        "connection reset",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "network is unreachable",
+        "no route to host",
+        "connectionerror",
+    )
+    return any(marker in lowered for marker in markers)
 
 
 def classify_archive_error(error: str | None) -> CaptureOutcomeKind:
@@ -58,6 +84,9 @@ def classify_archive_error(error: str | None) -> CaptureOutcomeKind:
 
     if "error:user-session-limit" in lowered or "error:cannot-fetch" in lowered:
         return CaptureOutcomeKind.DEFERRED_IA_BUSY
+
+    if is_network_connection_error(error):
+        return CaptureOutcomeKind.DEFERRED_NETWORK_ERROR
 
     if lowered.startswith("error:") or ": error:" in lowered:
         return CaptureOutcomeKind.CAPTURE_ERROR
@@ -150,6 +179,22 @@ def log_capture_outcome(
             url,
             _short_detail(detail),
         )
+        return kind
+
+    if kind == CaptureOutcomeKind.DEFERRED_NETWORK_ERROR:
+        if cooldown_seconds is not None:
+            log.warning(
+                "Cannot reach Internet Archive; re-queued, pausing new submits %.0fs: %s — %s",
+                cooldown_seconds,
+                url,
+                _short_detail(detail),
+            )
+        else:
+            log.warning(
+                "Cannot reach Internet Archive; re-queued: %s — %s",
+                url,
+                _short_detail(detail),
+            )
         return kind
 
     if kind == CaptureOutcomeKind.BLOCKED_DAILY_URL_CAP:

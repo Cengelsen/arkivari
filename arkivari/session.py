@@ -11,7 +11,12 @@ from typing import Callable
 
 import requests
 
-from arkivari.archive import ArchiveResult, ArchiveSummary, archive_url
+from arkivari.archive import (
+    ArchiveResult,
+    ArchiveSummary,
+    archive_url,
+    check_spn_connectivity,
+)
 from arkivari.capture_outcome import (
     CaptureOutcomeKind,
     is_deferred_outcome,
@@ -27,6 +32,7 @@ from arkivari.spn_config import SpnConfig
 SAVE_INTERVAL_SECONDS = 30.0
 SAVE_BATCH_SIZE = 10
 RATE_LIMIT_COOLDOWN_SECONDS = 30.0
+NETWORK_COOLDOWN_SECONDS = 120.0
 # Minimum spacing between SPN /save/status polls across all worker threads.
 SPN_POLL_MIN_INTERVAL_SECONDS = 2.0
 
@@ -36,6 +42,34 @@ class SessionOutcome:
     summary: ArchiveSummary
     interrupted: bool = False
     segments: int = 1
+
+
+def _wait_for_spn_connectivity(
+    log: logging.Logger,
+    spn_config: SpnConfig,
+    user_agent: str,
+) -> bool:
+    """Block until Save Page Now is reachable. Returns False if interrupted."""
+    session = requests.Session()
+    while True:
+        ok, err = check_spn_connectivity(
+            session,
+            spn_config=spn_config,
+            user_agent=user_agent,
+        )
+        if ok:
+            return True
+        detail = (err or "unknown error")[:200]
+        log.warning(
+            "Cannot reach Internet Archive Save Page Now (%s); retrying in %.0fs",
+            detail,
+            NETWORK_COOLDOWN_SECONDS,
+        )
+        try:
+            time.sleep(NETWORK_COOLDOWN_SECONDS)
+        except KeyboardInterrupt:
+            log.info("Wait interrupted; queue saved — run again to resume")
+            return False
 
 
 def _capture_worker(
@@ -115,6 +149,12 @@ def run_archive_session(
     executor = ThreadPoolExecutor(max_workers=spn_config.max_concurrent)
     in_flight: dict[Future[ArchiveResult], str] = {}
 
+    if queue.pending:
+        if not _wait_for_spn_connectivity(log, spn_config, user_agent):
+            executor.shutdown(wait=False)
+            queue.save(queue_path)
+            return SessionOutcome(summary=summary, interrupted=True, segments=segment)
+
     try:
         while queue.pending or in_flight:
             # -- quota gate --------------------------------------------------
@@ -190,6 +230,9 @@ def run_archive_session(
                     if kind == CaptureOutcomeKind.DEFERRED_SUBMIT_RATE_LIMIT:
                         rate_limiter.cooldown(RATE_LIMIT_COOLDOWN_SECONDS)
                         cooldown = RATE_LIMIT_COOLDOWN_SECONDS
+                    elif kind == CaptureOutcomeKind.DEFERRED_NETWORK_ERROR:
+                        rate_limiter.cooldown(NETWORK_COOLDOWN_SECONDS)
+                        cooldown = NETWORK_COOLDOWN_SECONDS
                     queue.move_to_back(url)
                     log_capture_outcome(
                         log,
@@ -197,6 +240,17 @@ def run_archive_session(
                         verbose=True,
                         cooldown_seconds=cooldown,
                     )
+                    if kind == CaptureOutcomeKind.DEFERRED_NETWORK_ERROR and not in_flight:
+                        if not _wait_for_spn_connectivity(log, spn_config, user_agent):
+                            for f in in_flight:
+                                f.cancel()
+                            executor.shutdown(wait=False)
+                            queue.save(queue_path)
+                            return SessionOutcome(
+                                summary=summary,
+                                interrupted=True,
+                                segments=segment,
+                            )
                 else:
                     queue.apply_archive_result(result)
                     log_capture_outcome(log, result, verbose=verbose)

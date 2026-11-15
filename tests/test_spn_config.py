@@ -18,6 +18,7 @@ from arkivari.spn_config import (
     SPN_CAPTURE_OPTIONS,
     SpnConfig,
     build_spn_submit_data,
+    discover_dotenv_path,
     load_dotenv,
     resolve_daily_limit,
     resolve_spn_config,
@@ -110,6 +111,36 @@ class TestResolveDailyLimit:
         assert resolve_daily_limit(500, config, user_set_daily_limit=True) == 500
 
 
+class TestDiscoverDotenvPath:
+    def test_explicit_path(self, tmp_path: Path) -> None:
+        env_file = tmp_path / ".env"
+        env_file.write_text("X=1\n", encoding="utf-8")
+        assert discover_dotenv_path(env_file) == env_file
+        assert discover_dotenv_path(tmp_path / "missing") is None
+
+    def test_finds_cwd_env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        env_file = tmp_path / ".env"
+        env_file.write_text("X=1\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+        assert discover_dotenv_path() == env_file
+
+    def test_finds_package_root_from_subdir(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import arkivari.spn_config as spn_config_module
+
+        repo = tmp_path / "repo"
+        sub = repo / "sub"
+        sub.mkdir(parents=True)
+        env_file = repo / ".env"
+        env_file.write_text("X=1\n", encoding="utf-8")
+        monkeypatch.setattr(spn_config_module, "_PACKAGE_ROOT", repo)
+        monkeypatch.chdir(sub)
+        assert discover_dotenv_path() == env_file
+
+
 class TestLoadDotenv:
     def test_loads_keys_from_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         env_file = tmp_path / ".env"
@@ -122,3 +153,34 @@ class TestLoadDotenv:
         monkeypatch.chdir(tmp_path)
         load_dotenv()
         assert os.environ.get(ACCESS_KEY_ENV) == "from-file"
+
+    def test_spn_keys_in_file_override_shell(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        env_file = tmp_path / ".env"
+        env_file.write_text(
+            f"{ACCESS_KEY_ENV}=file-access\n{SECRET_KEY_ENV}=file-secret\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv(ACCESS_KEY_ENV, "shell-access")
+        monkeypatch.setenv(SECRET_KEY_ENV, "shell-secret")
+        monkeypatch.chdir(tmp_path)
+        load_dotenv()
+        config = resolve_spn_config()
+        assert config.authenticated
+        assert config.access_key == "file-access"
+        assert config.secret_key == "file-secret"
+
+    def test_other_keys_do_not_override_shell(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        env_file = tmp_path / ".env"
+        env_file.write_text("OTHER_VAR=from-file\n", encoding="utf-8")
+        monkeypatch.setenv("OTHER_VAR", "from-shell")
+        monkeypatch.chdir(tmp_path)
+        load_dotenv()
+        assert os.environ.get("OTHER_VAR") == "from-shell"

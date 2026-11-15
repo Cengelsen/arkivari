@@ -11,6 +11,7 @@ from arkivari.capture_outcome import (
     CaptureOutcomeKind,
     classify_archive_error,
     is_deferred_outcome,
+    is_network_connection_error,
     log_capture_outcome,
     outcome_kind_for_result,
 )
@@ -45,6 +46,19 @@ class TestClassifyArchiveError:
             == CaptureOutcomeKind.CAPTURE_ERROR
         )
 
+    def test_connection_refused(self) -> None:
+        msg = (
+            'HTTPSConnectionPool(host="web.archive.org", port=443): Max retries exceeded '
+            'with url: /save (Caused by NewConnectionError("... Connection refused"))'
+        )
+        assert classify_archive_error(msg) == CaptureOutcomeKind.DEFERRED_NETWORK_ERROR
+        assert is_network_connection_error(msg)
+
+    def test_poll_timeout_not_network(self) -> None:
+        msg = "Capture timed out waiting for Internet Archive job"
+        assert not is_network_connection_error(msg)
+        assert classify_archive_error(msg) == CaptureOutcomeKind.DEFERRED_POLL_TIMEOUT
+
 
 class TestDeferredOutcomes:
     def test_rate_limit_is_deferred(self) -> None:
@@ -52,6 +66,9 @@ class TestDeferredOutcomes:
 
     def test_capture_error_not_deferred(self) -> None:
         assert not is_deferred_outcome(CaptureOutcomeKind.CAPTURE_ERROR)
+
+    def test_network_error_is_deferred(self) -> None:
+        assert is_deferred_outcome(CaptureOutcomeKind.DEFERRED_NETWORK_ERROR)
 
 
 class TestOutcomeKindForResult:
