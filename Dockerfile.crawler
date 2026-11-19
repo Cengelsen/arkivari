@@ -1,0 +1,15 @@
+FROM golang:1.22-bookworm AS build
+
+WORKDIR /src/crawler
+COPY crawler/go.mod crawler/go.sum* ./
+RUN go mod download
+COPY crawler/ ./
+RUN CGO_ENABLED=0 go build -o /crawler ./cmd/crawler
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /crawler /app/crawler
+ENV DOMAIN_LIST_PATH=/config/domains.json
+ENTRYPOINT ["/app/crawler"]

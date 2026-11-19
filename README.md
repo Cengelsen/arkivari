@@ -17,6 +17,50 @@ Discover public pages on a domain and archive them to the [Internet Archive](htt
 pip install -r requirements.txt
 ```
 
+## Docker Compose (modular pipeline)
+
+Postgres + Go **crawler** daemon + Python **archiver** daemon. The legacy CLI (`python -m arkivari`) still works with JSON queue files.
+
+### Quick start
+
+```bash
+cp .env.example .env
+# Optional: add SAVEPAGENOW_ACCESS_KEY / SAVEPAGENOW_SECRET_KEY for authenticated limits
+
+# Edit domains.json — set "enabled": true on domains to crawl
+docker compose up -d --build
+```
+
+Services:
+
+| Service | Role |
+|---------|------|
+| `postgres` | URL/domain state, archive queue, UTC quota |
+| `migrate` | Applies SQL migrations (one-shot) |
+| `crawler` | Syncs `domains.json`, discovers URLs, validates, writes `pending` rows |
+| `archiver` | `LISTEN arkivari_pending`, claims URLs, Save Page Now |
+
+### Environment
+
+See [`.env.example`](.env.example). In Compose, `DATABASE_URL` is set automatically for app containers. Mount secrets via `.env` for the archiver only.
+
+### Import legacy JSON queues
+
+```bash
+export DATABASE_URL=postgres://arkivari:arkivari@localhost:5432/arkivari?sslmode=disable
+python -m arkivari.db.import_queue arkivari-queue-example-com.json
+```
+
+Expose Postgres locally: copy `compose.override.yaml.example` to `compose.override.yaml`.
+
+### Smoke checklist
+
+1. `docker compose ps` — `postgres`, `crawler`, `archiver` running; `migrate` exited 0.
+2. Enable a domain in `domains.json` and `docker compose restart crawler`.
+3. `docker compose exec postgres psql -U arkivari -c "SELECT COUNT(*) FROM urls WHERE archive_status='pending';"`
+4. Archiver logs show capture activity (or quota wait when empty).
+5. Legacy CLI still works: `python -m arkivari example.com --dry-run`.
+
 ## Usage
 
 ```bash

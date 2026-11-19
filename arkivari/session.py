@@ -7,7 +7,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TypeAlias
 
 import requests
 
@@ -24,7 +24,7 @@ from arkivari.capture_outcome import (
     outcome_kind_for_result,
 )
 from arkivari.quota import wait_for_utc_quota_reset
-from arkivari.queue import ArchiveQueue
+from arkivari.work_queue import ArchiveWorkQueue
 from arkivari.rate_limiter import CrawlRateLimiter, TokenBucketRateLimiter
 from arkivari.robots import RobotsPolicy
 from arkivari.spn_config import SpnConfig
@@ -35,6 +35,8 @@ RATE_LIMIT_COOLDOWN_SECONDS = 30.0
 NETWORK_COOLDOWN_SECONDS = 120.0
 # Minimum spacing between SPN /save/status polls across all worker threads.
 SPN_POLL_MIN_INTERVAL_SECONDS = 2.0
+
+CanFetchFn: TypeAlias = Callable[[str], bool]
 
 
 @dataclass
@@ -90,15 +92,16 @@ def _capture_worker(
 
 
 def run_archive_session(
-    queue: ArchiveQueue,
-    queue_path: Path,
-    robots: RobotsPolicy,
+    queue: ArchiveWorkQueue,
+    queue_path: Path | None,
+    robots: RobotsPolicy | None,
     user_agent: str,
     until_complete: bool,
     verbose: bool,
     log: logging.Logger,
     spn_config: SpnConfig,
     on_segment_complete: Callable[[ArchiveSummary, int], None] | None = None,
+    can_fetch: CanFetchFn | None = None,
 ) -> SessionOutcome:
     """
     Archive pending URLs concurrently, respecting UTC daily quota and rate limits.
@@ -117,6 +120,17 @@ def run_archive_session(
     last_save_at = time.monotonic()
     completions_since_save = 0
 
+    def _url_allowed(url: str) -> bool:
+        if can_fetch is not None:
+            return can_fetch(url)
+        if robots is None:
+            return True
+        return robots.can_fetch(url)
+
+    def _persist() -> None:
+        if queue_path is not None:
+            queue.save(queue_path)
+
     def _needs_save() -> bool:
         return (
             completions_since_save >= SAVE_BATCH_SIZE
@@ -125,7 +139,7 @@ def run_archive_session(
 
     def _do_save() -> None:
         nonlocal last_save_at, completions_since_save
-        queue.save(queue_path)
+        _persist()
         last_save_at = time.monotonic()
         completions_since_save = 0
         log.info(
@@ -152,7 +166,7 @@ def run_archive_session(
     if queue.pending:
         if not _wait_for_spn_connectivity(log, spn_config, user_agent):
             executor.shutdown(wait=False)
-            queue.save(queue_path)
+            _persist()
             return SessionOutcome(summary=summary, interrupted=True, segments=segment)
 
     try:
@@ -181,7 +195,7 @@ def run_archive_session(
                 if url is None:
                     break
 
-                if not robots.can_fetch(url):
+                if not _url_allowed(url):
                     result = ArchiveResult(
                         url=url,
                         status="skipped",
@@ -245,7 +259,7 @@ def run_archive_session(
                             for f in in_flight:
                                 f.cancel()
                             executor.shutdown(wait=False)
-                            queue.save(queue_path)
+                            _persist()
                             return SessionOutcome(
                                 summary=summary,
                                 interrupted=True,
@@ -265,17 +279,18 @@ def run_archive_session(
         for f in in_flight:
             f.cancel()
         executor.shutdown(wait=False)
-        queue.save(queue_path)
+        _persist()
+        dest = str(queue_path) if queue_path is not None else "database"
         log.warning(
             "Archive interrupted (%d in-flight, %d pending); progress saved to %s",
             len(in_flight),
             queue.pending_count,
-            queue_path,
+            dest,
         )
         return SessionOutcome(summary=summary, interrupted=True, segments=segment)
 
     executor.shutdown(wait=True)
-    queue.save(queue_path)
+    _persist()
 
     if on_segment_complete and summary.results:
         on_segment_complete(summary, segment)

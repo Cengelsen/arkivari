@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "defaults": {
+    "max_pages": 0,
+    "recrawl_after_days": 90,
+    "enabled": false
+  },
+  "domains": [
+    {
+      "host": "cengelsen.no",
+      "enabled": false,
+      "max_pages": 100,
+      "recrawl_after_days": 180,
+      "note": "Smoke-test entry (disabled by default)"
+    }
+  ]
+}

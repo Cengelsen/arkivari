@@ -1,0 +1,5 @@
+# Optional local overrides: cp compose.override.yaml.example compose.override.yaml
+services:
+  postgres:
+    ports:
+      - "5432:5432"

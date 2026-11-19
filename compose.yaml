@@ -1,0 +1,65 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: arkivari
+      POSTGRES_PASSWORD: arkivari
+      POSTGRES_DB: arkivari
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arkivari -d arkivari"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    image: migrate/migrate:v4.18.1
+    volumes:
+      - ./migrations:/migrations:ro
+    command:
+      [
+        "-path",
+        "/migrations",
+        "-database",
+        "postgres://arkivari:arkivari@postgres:5432/arkivari?sslmode=disable",
+        "up",
+      ]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  crawler:
+    build:
+      context: .
+      dockerfile: Dockerfile.crawler
+    environment:
+      DATABASE_URL: postgres://arkivari:arkivari@postgres:5432/arkivari?sslmode=disable
+      DOMAIN_LIST_PATH: /config/domains.json
+      DOMAIN_SYNC_INTERVAL: 10m
+      CRAWLER_USER_AGENT: arkivari-crawler/1.0 (+https://github.com/arkivari)
+    volumes:
+      - ./domains.json:/config/domains.json:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  archiver:
+    build:
+      context: .
+      dockerfile: Dockerfile.archiver
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgres://arkivari:arkivari@postgres:5432/arkivari?sslmode=disable
+      ARKIVER_USER_AGENT: arkivari/1.0 (+https://github.com/arkivari)
+      ARCHIVER_IDLE_POLL_SECONDS: "60"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pgdata:
