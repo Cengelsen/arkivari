@@ -16,12 +16,15 @@ from psycopg_pool import ConnectionPool
 
 from arkivari.archive import ANONYMOUS_DAILY_CAP, ArchiveResult
 from arkivari.quota import utc_today_iso
-from arkivari.validate import INCLUDABLE_STATUSES
 
 logger = logging.getLogger(__name__)
 
+# Link statuses the Go crawler may persist; archiver claims these for Save Page Now.
+INCLUDABLE_LINK_STATUSES = frozenset(
+    ("ok", "redirected", "forbidden", "auth_required")
+)
 LEASE_DURATION = timedelta(minutes=15)
-INCLUDABLE_DB = tuple(sorted(INCLUDABLE_STATUSES))
+INCLUDABLE_DB = tuple(sorted(INCLUDABLE_LINK_STATUSES))
 NOTIFY_CHANNEL = "arkivari_pending"
 
 

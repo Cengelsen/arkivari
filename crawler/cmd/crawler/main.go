@@ -3,13 +3,13 @@ package main
 import (
 	"context"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/arkivari/crawler/internal/domainsync"
+	"github.com/arkivari/crawler/internal/httpclient"
 	"github.com/arkivari/crawler/internal/scheduler"
 	"github.com/arkivari/crawler/internal/store"
 )
@@ -49,7 +49,7 @@ func main() {
 		owner = "crawler"
 	}
 	st := store.New(pool, owner)
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := httpclient.Default()
 
 	sync := func() error {
 		return domainsync.Apply(ctx, st, listPath)

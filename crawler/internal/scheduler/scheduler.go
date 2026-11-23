@@ -7,11 +7,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/arkivari/crawler/internal/discover"
-	"github.com/arkivari/crawler/internal/robots"
+	"github.com/arkivari/crawler/internal/crawl"
 	"github.com/arkivari/crawler/internal/store"
-	"github.com/arkivari/crawler/internal/validate"
+	"github.com/jackc/pgx/v5"
 )
 
 type Scheduler struct {
@@ -30,50 +28,34 @@ func (s *Scheduler) RunOnce(ctx context.Context) error {
 	crawlCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	result, err := discover.Discover(crawlCtx, domain.BaseURL, s.UserAgent, s.Client, domain.MaxPages)
+	runner := &crawl.Runner{
+		Store:     s.Store,
+		UserAgent: s.UserAgent,
+		Client:    s.Client,
+	}
+	res, err := runner.RunAcquired(crawlCtx, domain)
 	var crawlErr error
 	if err != nil {
 		crawlErr = err
-	} else if len(result.URLs) > 0 {
-		policy := robots.New(domain.BaseURL, s.UserAgent, s.Client)
-		_ = policy.Load()
-		const batch = 50
-		for i := 0; i < len(result.URLs); i += batch {
-			end := i + batch
-			if end > len(result.URLs) {
-				end = len(result.URLs)
-			}
-			chunk := result.URLs[i:end]
-			validated := validate.FilterIncludable(crawlCtx, domain.BaseURL, s.UserAgent, s.Client, policy, chunk)
-			source := "sitemap"
-			if i >= result.Stats.SitemapFound {
-				source = "crawl"
-			}
-			n, err := s.Store.UpsertValidatedURLs(crawlCtx, domain.ID, source, validated)
-			if err != nil {
-				crawlErr = err
-				break
-			}
-			log.Printf("stored %d validated URLs for %s", n, domain.Host)
-		}
-	} else {
+	} else if res.URLsDiscovered() == 0 {
 		log.Printf("no URLs discovered for %s", domain.Host)
+	} else {
+		log.Printf(
+			"stored %d rows for %s (discovered=%d validated=%d batches=%d throttle=%d)",
+			res.Persist.StoredRows,
+			domain.Host,
+			res.URLsDiscovered(),
+			res.Persist.Validated,
+			res.Persist.ValidationBatches,
+			res.Throttle.Total,
+		)
 	}
 
 	if err := s.Store.CompleteCrawl(ctx, domain.ID, domain.RecrawlAfterDays, crawlErr); err != nil {
 		return err
 	}
-	if crawlErr != nil {
-		return crawlErr
-	}
-	return nil
+	return crawlErr
 }
-
-func IsNoWork(err error) bool {
-	return err != nil && errors.Is(err, errNoDomain)
-}
-
-var errNoDomain = errors.New("no domain to crawl")
 
 func (s *Scheduler) acquireOrIdle(ctx context.Context) error {
 	err := s.RunOnce(ctx)
@@ -82,6 +64,8 @@ func (s *Scheduler) acquireOrIdle(ctx context.Context) error {
 	}
 	return err
 }
+
+var errNoDomain = errors.New("no domain to crawl")
 
 func isPgNoRows(err error) bool {
 	return errors.Is(err, pgx.ErrNoRows)
@@ -102,14 +86,12 @@ func (s *Scheduler) Loop(ctx context.Context, syncFn func() error, syncInterval 
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					continue
 				case <-time.After(30 * time.Second):
-					continue
 				}
-			} else {
-				log.Printf("crawl error: %v", err)
-				time.Sleep(10 * time.Second)
+				continue
 			}
+			log.Printf("crawl error: %v", err)
+			time.Sleep(10 * time.Second)
 		}
 	}
 }

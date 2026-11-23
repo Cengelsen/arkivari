@@ -50,6 +50,44 @@ class TokenBucketRateLimiter:
         return self._capture_count
 
 
+ORIGIN_MAX_IN_FLIGHT = 16
+ORIGIN_RATE_LIMIT_BACKOFF_SECONDS = 15.0
+TRANSIENT_ORIGIN_CODES = frozenset({429, 502, 503})
+
+
+class OriginLimiter:
+    """Per-host origin access: max in-flight requests, optional crawl-delay, cooldown on 429."""
+
+    def __init__(self, crawl_delay: float, max_in_flight: int) -> None:
+        self._delay = max(crawl_delay, 0.0)
+        self._sem = threading.BoundedSemaphore(max(1, max_in_flight))
+        self._lock = threading.Lock()
+        self._last_start = 0.0
+        self._cooldown_until = 0.0
+
+    def begin(self) -> None:
+        self._sem.acquire()
+        wait = 0.0
+        with self._lock:
+            now = time.monotonic()
+            if now < self._cooldown_until:
+                wait = max(wait, self._cooldown_until - now)
+            if self._delay > 0:
+                wait = max(wait, self._delay - (now - self._last_start))
+        if wait > 0:
+            time.sleep(wait)
+        with self._lock:
+            self._last_start = time.monotonic()
+
+    def end(self, status_code: int = 0) -> None:
+        if status_code in TRANSIENT_ORIGIN_CODES:
+            with self._lock:
+                until = time.monotonic() + ORIGIN_RATE_LIMIT_BACKOFF_SECONDS
+                if until > self._cooldown_until:
+                    self._cooldown_until = until
+        self._sem.release()
+
+
 class CrawlRateLimiter:
     """Thread-safe minimum-interval limiter shared across threads.
 

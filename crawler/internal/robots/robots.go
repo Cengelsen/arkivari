@@ -1,7 +1,7 @@
 package robots
 
 import (
-	"fmt"
+	"context"
 	"io"
 	"net/http"
 	"net/url"
@@ -9,18 +9,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/arkivari/crawler/internal/config"
 	"github.com/temoto/robotstxt"
 )
-
-const defaultCrawlDelay = time.Second
 
 type Policy struct {
 	baseURL    string
 	userAgent  string
 	client     *http.Client
 	mu         sync.Mutex
-	lastFetch  time.Time
+	lastStart  time.Time
+	cooldown   time.Time
 	crawlDelay time.Duration
+	slots      chan struct{}
 	data       *robotstxt.RobotsData
 	group      *robotstxt.Group
 	fetched    bool
@@ -28,19 +29,26 @@ type Policy struct {
 
 func New(baseURL, userAgent string, client *http.Client) *Policy {
 	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
+		client = http.DefaultClient
+	}
+	max := config.OriginMaxConcurrency
+	if max < 1 {
+		max = 1
 	}
 	return &Policy{
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		userAgent:  userAgent,
 		client:     client,
-		crawlDelay: defaultCrawlDelay,
+		slots:      make(chan struct{}, max),
+		crawlDelay: config.DefaultCrawlDelay,
 	}
 }
 
-func (p *Policy) Load() error {
+func (p *Policy) Load(ctx context.Context) error {
 	robotsURL := p.baseURL + "/robots.txt"
-	req, err := http.NewRequest(http.MethodGet, robotsURL, nil)
+	reqCtx, cancel := context.WithTimeout(ctx, config.ValidationTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, robotsURL, nil)
 	if err != nil {
 		return err
 	}
@@ -56,7 +64,7 @@ func (p *Policy) Load() error {
 		p.fetched = true
 		return nil
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, config.MaxRobotsBodyBytes))
 	if err != nil {
 		return err
 	}
@@ -70,33 +78,62 @@ func (p *Policy) Load() error {
 	if p.group == nil {
 		p.group = data.FindGroup("*")
 	}
-	if p.group != nil {
-		if d := p.group.CrawlDelay; d > 0 {
-			p.crawlDelay = d
-		}
+	if p.group != nil && p.group.CrawlDelay > 0 {
+		p.crawlDelay = p.group.CrawlDelay
 	}
 	p.fetched = true
 	return nil
 }
 
+// Load without context uses Background (tests).
+func (p *Policy) loadLegacy() error {
+	return p.Load(context.Background())
+}
+
+func (p *Policy) ensureLoaded() {
+	if !p.fetched {
+		_ = p.loadLegacy()
+	}
+}
+
 func (p *Policy) WaitForCrawl() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.lastFetch.IsZero() {
-		p.lastFetch = time.Now()
-		return
+	p.slots <- struct{}{}
+	for {
+		p.mu.Lock()
+		now := time.Now()
+		var wait time.Duration
+		if now.Before(p.cooldown) {
+			wait = p.cooldown.Sub(now)
+		} else if p.crawlDelay > 0 {
+			if w := p.crawlDelay - now.Sub(p.lastStart); w > 0 {
+				wait = w
+			}
+		}
+		if wait <= 0 {
+			p.lastStart = now
+			p.mu.Unlock()
+			return
+		}
+		p.mu.Unlock()
+		time.Sleep(wait)
 	}
-	elapsed := time.Since(p.lastFetch)
-	if elapsed < p.crawlDelay {
-		time.Sleep(p.crawlDelay - elapsed)
+}
+
+// CrawlDone releases an origin slot; shared cooldown on rate-limit responses.
+func (p *Policy) CrawlDone(statusCode int) {
+	if statusCode == 429 || statusCode == 502 || statusCode == 503 {
+		p.mu.Lock()
+		until := time.Now().Add(config.OriginBackoff)
+		if until.After(p.cooldown) {
+			p.cooldown = until
+		}
+		p.mu.Unlock()
 	}
-	p.lastFetch = time.Now()
+	<-p.slots
 }
 
 func (p *Policy) CanFetch(rawURL string) bool {
-	if !p.fetched {
-		_ = p.Load()
-	}
+	p.ensureLoaded()
 	if p.group == nil {
 		return true
 	}
@@ -112,9 +149,7 @@ func (p *Policy) CanFetch(rawURL string) bool {
 }
 
 func (p *Policy) DefaultSitemapURLs() []string {
-	if !p.fetched {
-		_ = p.Load()
-	}
+	p.ensureLoaded()
 	seen := make(map[string]struct{})
 	var out []string
 	add := func(s string) {
@@ -132,15 +167,18 @@ func (p *Policy) DefaultSitemapURLs() []string {
 			add(s)
 		}
 	}
-	conventional := p.baseURL + "/sitemap.xml"
-	add(conventional)
+	add(p.baseURL + "/sitemap.xml")
 	return out
 }
 
-func (p *Policy) BaseURL() string {
-	return p.baseURL
+// SetCrawlDelayForTest adjusts robots crawl-delay in unit tests.
+func (p *Policy) SetCrawlDelayForTest(d time.Duration) {
+	p.SetCrawlDelay(d)
 }
 
-func (p *Policy) String() string {
-	return fmt.Sprintf("robots{%s}", p.baseURL)
+// SetCrawlDelay overrides crawl spacing between origin requests.
+func (p *Policy) SetCrawlDelay(d time.Duration) {
+	p.mu.Lock()
+	p.crawlDelay = d
+	p.mu.Unlock()
 }

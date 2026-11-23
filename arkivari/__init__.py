@@ -1,4 +1,4 @@
-"""Discover public pages on a domain and archive them to Internet Archive."""
+"""Postgres-backed Internet Archive archiver (daemon). Crawling is handled by the Go service."""
 
 __version__ = "1.0.0"
 

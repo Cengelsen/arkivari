@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/arkivari/crawler/internal/config"
 	"github.com/arkivari/crawler/internal/urlnorm"
 	"github.com/arkivari/crawler/internal/validate"
 	"github.com/jackc/pgx/v5"
@@ -108,23 +109,7 @@ func (s *Store) CompleteCrawl(ctx context.Context, domainID int64, recrawlDays i
 	return err
 }
 
-func (s *Store) UpsertValidatedURLs(ctx context.Context, domainID int64, source string, results []validate.LinkResult) (int, error) {
-	if len(results) == 0 {
-		return 0, nil
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback(ctx)
-
-	inserted := 0
-	for _, r := range results {
-		norm := urlnorm.NormalizeURL(r.URL)
-		if norm == "" {
-			norm = r.URL
-		}
-		tag, err := tx.Exec(ctx, `
+const upsertValidatedSQL = `
 			INSERT INTO urls (
 				domain_id, url, normalized_url, source, discovered_at,
 				link_status, http_code, final_url, validated_at,
@@ -143,17 +128,66 @@ func (s *Store) UpsertValidatedURLs(ctx context.Context, domainID int64, source 
 					ELSE 'pending'
 				END,
 				updated_at = NOW()
-		`, domainID, r.URL, norm, source, r.Status, r.HTTPCode, nullString(r.FinalURL))
+		`
+
+func (s *Store) UpsertValidatedURLs(ctx context.Context, domainID int64, source string, results []validate.LinkResult) (int, error) {
+	if len(results) == 0 {
+		return 0, nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	inserted := 0
+	for start := 0; start < len(results); start += config.DBBatchSize {
+		end := start + config.DBBatchSize
+		if end > len(results) {
+			end = len(results)
+		}
+		n, err := upsertValidatedBatch(ctx, tx, domainID, source, results[start:end])
 		if err != nil {
 			return inserted, err
 		}
-		inserted += int(tag.RowsAffected())
+		inserted += n
 	}
 	if s.notify && inserted > 0 {
 		_, _ = tx.Exec(ctx, `SELECT pg_notify('arkivari_pending', $1)`, fmt.Sprint(domainID))
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
+	}
+	return inserted, nil
+}
+
+func upsertValidatedBatch(
+	ctx context.Context,
+	tx pgx.Tx,
+	domainID int64,
+	source string,
+	results []validate.LinkResult,
+) (int, error) {
+	batch := &pgx.Batch{}
+	for _, r := range results {
+		norm := urlnorm.NormalizeURL(r.URL)
+		if norm == "" {
+			norm = r.URL
+		}
+		batch.Queue(
+			upsertValidatedSQL,
+			domainID, r.URL, norm, source, r.Status, r.HTTPCode, nullString(r.FinalURL),
+		)
+	}
+	br := tx.SendBatch(ctx, batch)
+	defer br.Close()
+	inserted := 0
+	for range results {
+		tag, err := br.Exec()
+		if err != nil {
+			return inserted, err
+		}
+		inserted += int(tag.RowsAffected())
 	}
 	return inserted, nil
 }

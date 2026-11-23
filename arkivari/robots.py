@@ -8,11 +8,11 @@ from urllib.robotparser import RobotFileParser
 
 import requests
 
-from arkivari.rate_limiter import CrawlRateLimiter
+from arkivari.rate_limiter import ORIGIN_MAX_IN_FLIGHT, OriginLimiter
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CRAWL_DELAY = 1.0
+DEFAULT_CRAWL_DELAY = 0.0
 
 
 class RobotsPolicy:
@@ -24,7 +24,7 @@ class RobotsPolicy:
         self.session = session or requests.Session()
         self._parser = RobotFileParser()
         self._loaded = False
-        self._crawl_limiter = CrawlRateLimiter(DEFAULT_CRAWL_DELAY)
+        self._origin = OriginLimiter(DEFAULT_CRAWL_DELAY, ORIGIN_MAX_IN_FLIGHT)
 
     def load(self) -> None:
         """Fetch robots.txt from the target domain."""
@@ -48,7 +48,7 @@ class RobotsPolicy:
             if response.status_code == 200:
                 self._parser.parse(response.text.splitlines())
                 self._loaded = True
-                self._crawl_limiter = CrawlRateLimiter(self._resolve_crawl_delay())
+                self._origin = OriginLimiter(self._resolve_crawl_delay(), ORIGIN_MAX_IN_FLIGHT)
                 logger.info("Loaded robots.txt from %s", robots_url)
                 return
 
@@ -63,7 +63,7 @@ class RobotsPolicy:
     def _apply_permissive_policy(self) -> None:
         self._parser.parse(["User-agent: *", "Allow: /"])
         self._loaded = True
-        self._crawl_limiter = CrawlRateLimiter(DEFAULT_CRAWL_DELAY)
+        self._origin = OriginLimiter(DEFAULT_CRAWL_DELAY, ORIGIN_MAX_IN_FLIGHT)
 
     def _resolve_crawl_delay(self) -> float:
         delay = self._parser.crawl_delay(self.user_agent)
@@ -87,8 +87,12 @@ class RobotsPolicy:
         return list(sitemaps)
 
     def wait_for_crawl(self) -> None:
-        """Enforce crawl-delay between requests to the target site (thread-safe)."""
-        self._crawl_limiter.acquire()
+        """Acquire a slot for an origin HTTP request (concurrency + optional crawl-delay)."""
+        self._origin.begin()
+
+    def crawl_done(self, status_code: int = 0) -> None:
+        """Release origin slot; apply shared cooldown when the site rate-limits."""
+        self._origin.end(status_code)
 
     def default_sitemap_urls(self) -> list[str]:
         """Return sitemap URLs from robots.txt plus the conventional /sitemap.xml."""
