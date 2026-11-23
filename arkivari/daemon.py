@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import select
-import sys
-import time
 
 import psycopg
 import requests
@@ -35,15 +32,8 @@ def _wait_for_notify(conn: psycopg.Connection, timeout: float) -> bool:
     """Return True if a notification or timeout occurred (caller should claim work)."""
     if timeout <= 0:
         return True
-    fileno = conn.fileno()
-    if fileno is None:
-        time.sleep(timeout)
-        return True
-    _r, _w, _x = select.select([fileno], [], [], timeout)
-    if _r:
-        conn.poll()
-        while conn.notifies:
-            conn.notifies.pop(0)
+    for _ in conn.notifies(timeout=timeout, stop_after=1):
+        pass
     return True
 
 

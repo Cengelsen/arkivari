@@ -5,5 +5,6 @@ arkivari-results.json
 arkivari-queue-*.json
 .pytest_cache/
 .env
+domains.json
 pgdata/
 compose.override.yaml

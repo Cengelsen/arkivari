@@ -7,11 +7,11 @@
   },
   "domains": [
     {
-      "host": "cengelsen.no",
+      "host": "example.com",
       "enabled": false,
       "max_pages": 100,
       "recrawl_after_days": 180,
-      "note": "Smoke-test entry (disabled by default)"
+      "note": "Copy to domains.json and set enabled to true"
     }
   ]
 }

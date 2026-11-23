@@ -26,6 +26,7 @@ Python entrypoint: `python -m arkivari` or `python -m arkivari.daemon` → [`ark
 
 ```bash
 cp .env.example .env
+cp domains.json.example domains.json
 # Optional: SAVEPAGENOW_ACCESS_KEY / SAVEPAGENOW_SECRET_KEY in .env
 
 # Edit domains.json — set "enabled": true on domains to crawl
@@ -50,7 +51,7 @@ export DATABASE_URL=postgres://arkivari:arkivari@localhost:5432/arkivari?sslmode
 cd crawler && go run ./cmd/crawler
 ```
 
-Requires `domains.json` (or `DOMAIN_LIST_PATH`) and a running Postgres with migrations applied.
+Copy `domains.json.example` to `domains.json` (or set `DOMAIN_LIST_PATH`) and apply migrations before running the crawler.
 
 ### Python archiver
 
@@ -68,7 +69,7 @@ python -m arkivari
 
 ## domains.json
 
-Each entry: `host`, optional `max_pages` (0 = unlimited), `recrawl_after_days`, `enabled`, `note`. The crawler upserts enabled hosts into `domains` and schedules crawls.
+Create from `domains.json.example` (gitignored; not committed). Each entry: `host`, optional `max_pages` (0 = unlimited), `recrawl_after_days`, `enabled`, `note`. The crawler upserts enabled hosts into `domains` and schedules crawls.
 
 ## Limitations
 
