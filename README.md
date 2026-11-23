@@ -85,8 +85,23 @@ Create from `domains.json.example` (gitignored; not committed). Each entry: `hos
 ## Limitations
 
 - Discovery from HTML links and sitemaps only (no JS rendering).
-- Internet Archive daily capture limits apply (see archiver quota in `quota_daily`).
 - robots.txt respected on crawl and archive (archiver uses per-domain cache).
+
+## Save Page Now and the Wayback Machine
+
+The archiver does **not** use the CDX or Memento APIs to “register” URLs. Each pending row is handed to [Save Page Now](https://web.archive.org/save) (SPN): a `POST` starts a capture job on Internet Archive (IA) infrastructure, then the client polls job status until completion, failure, or timeout ([`arkivari/archive.py`](arkivari/archive.py)). That design fits a background queue, but it comes with hard limits and uneven guarantees.
+
+**Throughput and quotas.** IA throttles and caps anonymous and logged-in use. arkivari rate-limits submissions (about 6/min anonymous, 7/min with archive.org credentials) and tracks a **UTC calendar-day** budget in Postgres (`quota_daily`), aligned with caps in [`arkivari/spn_config.py`](arkivari/spn_config.py). IA can still return errors such as `too-many-daily-captures`, HTTP 429, or session limits; the archiver then marks rows **deferred** and retries later rather than dropping them.
+
+**Not the same snapshot as your crawl.** The Go crawler performs its own GET checks (HTML + sitemaps, no browser). SPN asks IA’s fetchers to retrieve the URL again. Paywalled, geo-blocked, bot-challenged, or heavily JavaScript-dependent pages may archive poorly or differently from what you saw locally. arkivari does not render pages before sending them to IA.
+
+**Reuse vs new captures.** With archive.org credentials, requests use `skip_first_archive` and `if_not_archived_within` (default **30m**): if IA already has a recent snapshot, the job may finish as **cached** (existing Wayback URL) instead of a fresh capture. That saves quota but means “archived” in the DB is not always a brand-new crawl on IA’s side.
+
+**Per-host and global pressure.** Bursts on one host can trigger IA “host overloaded” or “host paused” responses. IA also limits concurrent pending jobs per account. arkivari keeps concurrency conservative ([`spn_config.py`](arkivari/spn_config.py)) and backs off on overload, but large sites still drain slowly.
+
+**Auth and operations.** Optional `SAVEPAGENOW_ACCESS_KEY` / `SAVEPAGENOW_SECRET_KEY` (IA S3 keys) or browser session cookies improve limits; without them the archiver runs in anonymous mode. S3 keys and SPN do not always behave like a normal REST API—credential probes and 401 handling are in code for a reason. There is no SLA: outages, queue delays, and changed IA behavior show up as deferred rows, poll timeouts, or `failed` with a message in `last_error`.
+
+**What this project is for.** arkivari is meant to **steadily** queue modest corpora you are allowed to archive, not to mirror the whole web as fast as your crawl discovers URLs. Respect [Internet Archive’s terms](https://archive.org/about/terms.php) and the sites you crawl; use authenticated SPN when volume matters.
 
 ## License
 

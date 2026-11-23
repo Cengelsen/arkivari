@@ -1,9 +1,18 @@
-.venv/
-__pycache__/
-*.pyc
+# IDE generated files
+.cursor/
+.claude/
+
+# legacy crawler generated files
 arkivari-results.json
 arkivari-queue-*.json
+
+# Python generated files
 .pytest_cache/
+__pycache__/
+*.pyc
+.venv/
+
+# Customized local files
 .env
 domains.json
 pgdata/
