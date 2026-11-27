@@ -25,10 +25,17 @@ type CrawlResult struct {
 }
 
 type pageResult struct {
-	url   string
-	links []string
-	ok    bool // HTTP 200 HTML parsed successfully
-	check validate.LinkResult
+	url             string
+	links           []string
+	ok              bool // HTTP 200 HTML parsed successfully
+	isDocument      bool // HTTP 200 allowlisted file (for archive queue)
+	crossOriginOnly bool // job was a cross-origin document probe (no foreign HTML BFS)
+	check           validate.LinkResult
+}
+
+type crawlJob struct {
+	url         string
+	crossOrigin bool // linked from site HTML; verify file, do not BFS foreign HTML
 }
 
 // CrawlSite runs concurrent BFS with one coordinator goroutine and a fixed worker pool.
@@ -55,13 +62,13 @@ func CrawlSite(
 
 	hc := httpclient.ForCrawl(client, targetNetloc, policy)
 
-	jobs := make(chan string, config.CrawlWorkers)
+	jobs := make(chan crawlJob, config.CrawlWorkers)
 	results := make(chan pageResult, config.CrawlWorkers*2)
 
 	var wg sync.WaitGroup
 	for range config.CrawlWorkers {
 		wg.Add(1)
-		go crawlWorker(crawlCtx, &wg, jobs, results, userAgent, policy, hc, errorPage)
+		go crawlWorker(crawlCtx, &wg, jobs, results, userAgent, policy, client, hc, errorPage)
 	}
 	go func() {
 		wg.Wait()
@@ -74,6 +81,7 @@ func CrawlSite(
 	}
 
 	queue := []string{seed}
+	crossDocQueue := []string{}
 	seen := make(map[string]struct{})
 	discovered := make(map[string]struct{})
 	checked := make(map[string]validate.LinkResult)
@@ -81,6 +89,45 @@ func CrawlSite(
 	inFlight := 0
 	capped := false
 	interrupted := false
+
+	enqueueCrossDocument := func(raw string) {
+		normalized := urlnorm.NormalizeURL(raw)
+		if normalized == "" {
+			return
+		}
+		if urlnorm.SameDomain(normalized, targetNetloc) {
+			return
+		}
+		if _, ok := seen[normalized]; ok {
+			return
+		}
+		crossDocQueue = append(crossDocQueue, normalized)
+	}
+
+	dispatch := func(url string, crossOrigin bool) bool {
+		normalized := urlnorm.NormalizeURL(url)
+		if normalized == "" {
+			return false
+		}
+		if _, dup := seen[normalized]; dup {
+			return false
+		}
+		seen[normalized] = struct{}{}
+		if !crossOrigin {
+			if !urlnorm.SameDomain(normalized, targetNetloc) || !policy.CanFetch(normalized) {
+				delete(seen, normalized)
+				return false
+			}
+		}
+		select {
+		case <-crawlCtx.Done():
+			delete(seen, normalized)
+			return false
+		case jobs <- crawlJob{url: normalized, crossOrigin: crossOrigin}:
+			inFlight++
+			return true
+		}
+	}
 
 	finish := func() CrawlResult {
 		shutdownWorkers()
@@ -98,26 +145,24 @@ func CrawlSite(
 			}
 			current := queue[0]
 			queue = queue[1:]
-			normalized := urlnorm.NormalizeURL(current)
-			if normalized == "" {
+			if !dispatch(current, false) {
 				continue
 			}
-			if _, dup := seen[normalized]; dup {
-				continue
-			}
-			seen[normalized] = struct{}{}
-			if !urlnorm.SameDomain(normalized, targetNetloc) || !policy.CanFetch(normalized) {
-				continue
-			}
-			select {
-			case <-crawlCtx.Done():
+		}
+		for len(crossDocQueue) > 0 && inFlight < config.CrawlWorkers {
+			if !unlimited && len(discovered)+inFlight >= maxPages {
+				capped = true
+				cancel()
 				return finish()
-			case jobs <- normalized:
-				inFlight++
+			}
+			current := crossDocQueue[0]
+			crossDocQueue = crossDocQueue[1:]
+			if !dispatch(current, true) {
+				continue
 			}
 		}
 
-		if inFlight == 0 && len(queue) == 0 {
+		if inFlight == 0 && len(queue) == 0 && len(crossDocQueue) == 0 {
 			return finish()
 		}
 
@@ -138,17 +183,21 @@ func CrawlSite(
 				cancel()
 				return finish()
 			}
-			if res.ok {
+			if res.isDocument || (res.ok && !res.crossOriginOnly) {
 				if _, ex := exclude[res.url]; !ex {
 					discovered[res.url] = struct{}{}
 				}
+			}
+			if res.ok && !res.crossOriginOnly {
 				for _, link := range res.links {
 					if urlnorm.SameDomain(link, targetNetloc) {
 						queue = append(queue, link)
+						continue
 					}
+					enqueueCrossDocument(link)
 				}
 			}
-			if !unlimited && len(discovered) >= maxPages && (len(queue) > 0 || inFlight > 0) {
+			if !unlimited && len(discovered) >= maxPages && (len(queue) > 0 || len(crossDocQueue) > 0 || inFlight > 0) {
 				capped = true
 				cancel()
 				return finish()
@@ -172,19 +221,23 @@ func finishCrawl(discovered map[string]struct{}, checked map[string]validate.Lin
 func crawlWorker(
 	ctx context.Context,
 	wg *sync.WaitGroup,
-	jobs <-chan string,
+	jobs <-chan crawlJob,
 	results chan<- pageResult,
 	userAgent string,
 	policy *robots.Policy,
-	client *http.Client,
+	plainClient, siteClient *http.Client,
 	errorPage string,
 ) {
 	defer wg.Done()
-	for pageURL := range jobs {
+	for job := range jobs {
 		if ctx.Err() != nil {
 			return
 		}
-		res := fetchPage(ctx, pageURL, userAgent, policy, client, errorPage)
+		httpClient := siteClient
+		if job.crossOrigin {
+			httpClient = plainClient
+		}
+		res := fetchPage(ctx, job.url, userAgent, policy, httpClient, errorPage, job.crossOrigin)
 		select {
 		case results <- res:
 		case <-ctx.Done():
@@ -199,23 +252,25 @@ func fetchPage(
 	policy *robots.Policy,
 	client *http.Client,
 	errorPage string,
+	crossOrigin bool,
 ) pageResult {
-	policy.WaitForCrawl()
+	res := pageResult{url: pageURL, crossOriginOnly: crossOrigin}
 	statusCode := 0
-	defer func() { policy.CrawlDone(statusCode) }()
+	if !crossOrigin {
+		policy.WaitForCrawl()
+		defer func() { policy.CrawlDone(statusCode) }()
+	}
 	reqCtx, cancel := context.WithTimeout(ctx, config.CrawlTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, pageURL, nil)
 	if err != nil {
-		return pageResult{url: pageURL}
+		return res
 	}
 	req.Header.Set("User-Agent", userAgent)
 	resp, err := client.Do(req)
 	if err != nil {
-		return pageResult{
-			url:   pageURL,
-			check: validate.LinkResult{URL: pageURL, Status: "network_error", Error: err.Error()},
-		}
+		res.check = validate.LinkResult{URL: pageURL, Status: "network_error", Error: err.Error()}
+		return res
 	}
 	defer resp.Body.Close()
 	statusCode = resp.StatusCode
@@ -224,14 +279,32 @@ func fetchPage(
 		final = resp.Request.URL.String()
 	}
 	check := validate.ResultFromGET(pageURL, statusCode, final, errorPage)
-	if resp.StatusCode != http.StatusOK || !isHTML(resp.Header.Get("Content-Type")) {
-		_, _ = io.CopyN(io.Discard, resp.Body, config.MaxResponseBodyBytes)
-		return pageResult{url: pageURL, check: check}
+	ctype := resp.Header.Get("Content-Type")
+	if resp.StatusCode != http.StatusOK || !isHTML(ctype) {
+		var prefix []byte
+		if resp.StatusCode == http.StatusOK {
+			buf := make([]byte, documentSniffLen)
+			n, _ := io.ReadFull(io.LimitReader(resp.Body, documentSniffLen), buf)
+			if n > 0 {
+				prefix = buf[:n]
+			}
+			_, _ = io.CopyN(io.Discard, resp.Body, config.MaxResponseBodyBytes)
+			if ResponseIsDocument(ctype, resp.Header.Get("Content-Disposition"), prefix) {
+				res.isDocument = true
+				res.check = check
+				return res
+			}
+		} else {
+			_, _ = io.CopyN(io.Discard, resp.Body, config.MaxResponseBodyBytes)
+		}
+		res.check = check
+		return res
 	}
 	body := io.LimitReader(resp.Body, config.MaxResponseBodyBytes)
 	doc, err := goquery.NewDocumentFromReader(body)
 	if err != nil {
-		return pageResult{url: pageURL, check: check}
+		res.check = check
+		return res
 	}
 	var links []string
 	doc.Find("a[href]").Each(func(_ int, s *goquery.Selection) {
@@ -247,7 +320,10 @@ func fetchPage(
 			links = append(links, normalized)
 		}
 	})
-	return pageResult{url: pageURL, links: links, ok: true, check: check}
+	res.links = links
+	res.ok = true
+	res.check = check
+	return res
 }
 
 func sortedKeys(m map[string]struct{}) []string {
